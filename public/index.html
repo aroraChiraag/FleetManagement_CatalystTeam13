@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dispatch Copilot · Trans Ontario Express</title>
+  <meta name="description" content="AI dispatch copilot for Trans Ontario Express: plan the day, catch problems early, adapt to disruptions." />
+  <link rel="icon" type="image/png" href="assets/logo.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="top">
+    <a href="#/pitch" aria-label="Trans Ontario Express home"><img class="logo" src="assets/logo.png" alt="Trans Ontario Express" /></a>
+    <div class="product"><b>Dispatch Copilot</b><span>Plan · Detect · Adapt</span></div>
+    <div class="spacer"></div>
+    <label class="api-dot" id="apiStatus"><i></i><span>Connecting…</span></label>
+    <select id="dateSelect" aria-label="Operating day"></select>
+  </header>
+
+  <nav class="nav" id="nav">
+    <div class="group">Story</div>
+    <a href="#/pitch" data-view="pitch"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l18-8-8 18-2-8-8-2z"/></svg>Pitch</a>
+    <div class="group">Dispatch</div>
+    <a href="#/plan" data-view="plan"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 20l-6-3V4l6 3 6-3 6 3v13l-6-3-6 3z"/><path d="M9 7v13M15 4v13"/></svg>Plan the Day</a>
+    <a href="#/problems" data-view="problems"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>Problems</a>
+    <a href="#/adapt" data-view="adapt"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>Adapt</a>
+    <div class="group">Connect</div>
+    <a href="#/api" data-view="api"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg>API &amp; Exports</a>
+    <a href="#/assumptions" data-view="assumptions"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>Data &amp; Assumptions</a>
+    <div class="foot"><b>Team #13</b> · Catalyst Hackathon<br />Challenge sponsor: Trans Ontario Express<br />Demo on pseudonymised data, 20 Sep – 3 Oct 2026</div>
+  </nav>
+
+  <main id="view"><div class="loading"><span class="spinner"></span>Loading Dispatch Copilot…</div></main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="engine/engine.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

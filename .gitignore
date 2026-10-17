@@ -1,0 +1,11 @@
+# saved custom plans are per machine
+data/custom-plans.json
+
+# local tooling
+.claude/
+node_modules/
+__pycache__/
+*.pyc
+*.zip
+.DS_Store
+Thumbs.db
