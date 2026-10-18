@@ -25,8 +25,8 @@
   const ASSUMPTIONS = {
     roadFactor: { value: 1.3, text: 'Road distance = straight-line distance × 1.3 (GTA circuity). Replace with Google Routes / Samsara distances in production.' },
     speeds: { value: '32 km/h first 15 km, 68 km/h after', text: 'Urban legs average 32 km/h, highway portion 68 km/h.' },
-    serviceTime: { value: '15 min + extras', text: '15 min per stop (same as the Samsara set-up) + 4 min per skid over 2, +15 inside delivery / helpers, +10 tailgate, +10 residential, capped at 75 min.' },
-    shift: { value: '06:30 on duty, 07:00 departure', text: '30 min loading/pre-trip before departure, 15 min post-trip after return. Routes may depart as early as 05:00 for early appointments.' },
+    serviceTime: { value: 'Learned per customer from history; else 15 min + extras', text: 'Time on site is the median of Samsara GPS visits to the same customer on other days (5 to 90 min; visits under 2 min were app taps, not measured). Customers with no other visit use 15 min + 4 min per skid over 2, +15 inside delivery / helpers, +10 tailgate, +10 residential, capped at 75 min. The same times apply to both plans.' },
+    shift: { value: '06:30 on duty, 07:00 departure', text: 'Copilot routes: 30 min loading/pre-trip before departure, 15 min post-trip after return. As-dispatched routes leave when the driver really left (first GPS arrival minus the modelled drive), including night starts. Early-start shifts may depart from 03:30 when the first stop has an early appointment (drivers in the export left as early as 03:36).' },
     hos: { value: '13 h driving / 14 h on duty', text: 'Canadian federal Commercial Vehicle Drivers Hours of Service (south of 60°N) daily limits.' },
     capacity: { value: 'Straight 10,000 lb / 12 spots · 53′ 48,000 lb / 26 spots · Van 2,500 lb / 2 spots', text: 'Vehicle class inferred from unit name (Truck # / Tractor # / plate-only). Payloads are typical values, not unit-specific specs.' },
     licence: { value: 'AZ if ever seen in a tractor, else DZ', text: 'Driver licence class inferred from the vehicles each driver drove in the 2-week export.' },
@@ -36,11 +36,12 @@
     partner: { value: 'LTL $125 + (weight/100) × ($9 + $0.045/km) · FTL $350 + $3/km', text: 'Indicative partner-carrier quotes (LTL by weight and distance, FTL over 10,000 lb by distance). Used for out-of-province freight and when the in-house marginal cost is higher.' },
     stacking: { value: 'Skids floor-loaded, loose freight may share a spot', text: 'Skids/pallets are not stacked (no stackability data in Elite); loose pieces < 1 spot share a spot; dangerous goods never stacked.' },
     co2: { value: '0.95 kg CO₂e per truck-km', text: 'Diesel medium/heavy truck average; indicative only.' },
+    events: { value: 'Simulated road & weather events, off by default', text: 'When switched on, each day gets a fixed, clearly simulated set of events: a planned ramp closure, construction, a weather band, event traffic near a venue and one or two accidents. Closures, construction, forecast weather and venue events are known in advance, so the copilot plans around them; accidents are not, so they hit every plan. As-dispatched routes keep their sequence and absorb every event. Headline results are computed with events off.' },
   };
 
   const DEPOT_DEFAULT = { lat: 43.80800808529279, lng: -79.24190011829823 };
   const WAGE = 34, REAL_MIN_SHIFT = 480, PRETRIP = 30, POSTTRIP = 15, RELOAD = 20;
-  const EARLIEST_DEPART = 300, DAY_START = 390;
+  const EARLIEST_DEPART = 210, DAY_START = 390; // early-start shifts from 03:30, as drivers did in the export (15 departures before 05:00)
   const DRIVE_MAX = 780;
 
   // ------------------------------------------------------------------ plan settings (custom plans)
@@ -50,7 +51,7 @@
     balanced: { label: 'Use the whole fleet', text: 'Starting a truck is free and long shifts are penalised, so work is spread across every available driver and vehicle type.', minShift: 0, latePenalty: 10, kmWeight: 1, balance: 0.1 },
     distance: { label: 'Fewest kilometres', text: 'Distance weighs three times as much: the lowest fuel and emissions, even if it uses a few more driver hours.', minShift: 240, latePenalty: 10, kmWeight: 3, balance: 0 },
   };
-  const DEFAULT_SETTINGS = { objective: 'cost', departTime: 420, maxDutyHours: 14, serviceMin: 15, allowPartner: true, allowReloads: true, liveReplay: true, drivers: null };
+  const DEFAULT_SETTINGS = { objective: 'cost', departTime: 420, maxDutyHours: 14, serviceMin: 15, allowPartner: true, allowReloads: true, liveReplay: true, drivers: null, events: 'off' };
   function makeCfg(settings) {
     const st = Object.assign({}, DEFAULT_SETTINGS, settings || {});
     st.objective = OBJECTIVES[st.objective] ? st.objective : 'cost';
@@ -58,14 +59,133 @@
     st.maxDutyHours = Math.max(6, Math.min(14, Number(st.maxDutyHours) || 14));
     st.departTime = Math.max(300, Math.min(600, Number(st.departTime) || 420));
     st.serviceMin = Math.max(5, Math.min(40, Number(st.serviceMin) || 15));
+    st.events = st.events === 'on' ? 'on' : 'off';
     return {
       settings: st, objective: st.objective,
       depart: st.departTime, dutyMax: st.maxDutyHours * 60, serviceBase: st.serviceMin,
       allowPartner: st.allowPartner !== false, allowReloads: st.allowReloads !== false,
       minShift: o.minShift, latePenalty: o.latePenalty, kmWeight: o.kmWeight, balance: o.balance, promiseSlack: 0,
+      eventList: [], eventsActive: [],
     };
   }
   let C = makeCfg();
+
+  // ------------------------------------------------------------------ simulated road & weather events (demo only)
+  const EVENT_KINDS = {
+    road_closure: { label: 'Road closure', color: '#C62828', known: true },
+    construction: { label: 'Construction', color: '#A86200', known: true },
+    weather: { label: 'Weather', color: '#1F4AEE', known: true },
+    festival: { label: 'Event traffic', color: '#7A3FF2', known: true },
+    accident: { label: 'Accident', color: '#030718', known: false },
+  };
+  const HOTSPOTS = [
+    { name: 'Hwy 401 at Hwy 400', road: 'Hwy 401', lat: 43.723, lng: -79.529 },
+    { name: 'Hwy 401 at Hwy 427', road: 'Hwy 401', lat: 43.689, lng: -79.577 },
+    { name: 'Hwy 401 at Hwy 404', road: 'Hwy 401', lat: 43.77, lng: -79.346 },
+    { name: 'Hwy 401 at Markham Rd', road: 'Hwy 401', lat: 43.792, lng: -79.237 },
+    { name: 'Hwy 401 at Hwy 410', road: 'Hwy 401', lat: 43.647, lng: -79.684 },
+    { name: 'Gardiner Expressway', road: 'Gardiner Expressway', lat: 43.638, lng: -79.4 },
+    { name: 'Don Valley Parkway', road: 'Don Valley Parkway', lat: 43.702, lng: -79.358 },
+    { name: 'Hwy 400 at Hwy 407', road: 'Hwy 400', lat: 43.797, lng: -79.534 },
+    { name: 'Hwy 427 at QEW', road: 'Hwy 427', lat: 43.618, lng: -79.548 },
+    { name: 'Hwy 410 in Brampton', road: 'Hwy 410', lat: 43.712, lng: -79.724 },
+    { name: 'Hwy 401 in Pickering', road: 'Hwy 401', lat: 43.836, lng: -79.087 },
+    { name: 'QEW at the Burlington Skyway', road: 'QEW', lat: 43.301, lng: -79.793 },
+    { name: 'Hwy 401 near Milton', road: 'Hwy 401', lat: 43.525, lng: -79.883 },
+    { name: 'Hwy 404 at Hwy 7', road: 'Hwy 404', lat: 43.848, lng: -79.382 },
+  ];
+  const REGIONS = [
+    { name: 'Peel Region (Mississauga, Brampton)', lat: 43.66, lng: -79.7, radius: 20 },
+    { name: 'York Region', lat: 43.87, lng: -79.45, radius: 20 },
+    { name: 'Hamilton and Burlington', lat: 43.3, lng: -79.85, radius: 20 },
+    { name: 'Waterloo Region', lat: 43.45, lng: -80.45, radius: 20 },
+    { name: 'Durham Region', lat: 43.88, lng: -78.95, radius: 20 },
+    { name: 'Toronto', lat: 43.7, lng: -79.4, radius: 16 },
+  ];
+  const VENUES = [
+    { name: 'Rogers Centre', what: 'Baseball game', lat: 43.6414, lng: -79.3894 },
+    { name: 'Scotiabank Arena', what: 'Concert', lat: 43.6435, lng: -79.3791 },
+    { name: 'Exhibition Place', what: 'Trade show', lat: 43.633, lng: -79.418 },
+    { name: 'International Centre, Mississauga', what: 'Trade show', lat: 43.693, lng: -79.628 },
+    { name: "Canada's Wonderland", what: 'Seasonal event', lat: 43.843, lng: -79.539 },
+  ];
+  function seededRandom(text) {
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return () => {
+      h += 0x6d2b79f5;
+      let t = h;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  /** The same simulated events every time for a given day, so a demo can be repeated. */
+  function eventsForDay(date) {
+    const rnd = seededRandom('toe-events-' + date);
+    const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+    const used = new Set();
+    const spot = () => { let h, n = 0; do { h = pick(HOTSPOTS); n++; } while (used.has(h.name) && n < 50); used.add(h.name); return h; };
+    const ev = [];
+    const add = (o) => ev.push(Object.assign({ id: 'EV' + (ev.length + 1), simulated: true }, o));
+    let h = spot();
+    add({ kind: 'road_closure', title: `Ramp closure, ${h.name}`, place: h.name, lat: h.lat, lng: h.lng, radius: 3, from: 300, to: 570, delay: 15, extraKm: 8, detail: 'Planned bridge work; trucks detour through the next interchange (about +15 min, +8 km).' });
+    h = spot();
+    add({ kind: 'construction', title: `Lane reductions, ${h.name}`, place: h.name, lat: h.lat, lng: h.lng, radius: 4, from: 360, to: 1140, delay: 8, detail: 'Two lanes closed for paving all day (about +8 min).' });
+    const wx = pick([{ t: 'Heavy rain', slow: 0.25 }, { t: 'Dense fog', slow: 0.3 }, { t: 'Thunderstorms', slow: 0.3 }]);
+    const reg = pick(REGIONS);
+    const wFrom = pick([360, 420, 540, 780, 900]);
+    add({ kind: 'weather', title: `${wx.t} over ${reg.name}`, place: reg.name, lat: reg.lat, lng: reg.lng, radius: reg.radius, from: wFrom, to: wFrom + 180, slow: wx.slow, detail: `Forecast the evening before: speeds about ${Math.round(wx.slow * 100)}% lower for 3 hours.` });
+    const v = pick(VENUES);
+    const vFrom = pick([780, 840, 900]);
+    add({ kind: 'festival', title: `${v.what} at ${v.name}`, place: v.name, lat: v.lat, lng: v.lng, radius: 3, from: vFrom, to: vFrom + 240, delay: 20, detail: 'Event traffic and road closures around the venue (about +20 min).' });
+    const nAcc = 1 + Math.floor(rnd() * 2);
+    // accidents happen on the busy GTA corridors the trucks actually use
+    const BUSY = ['Hwy 401 at Hwy 400', 'Hwy 401 at Hwy 427', 'Hwy 401 at Hwy 404', 'Hwy 401 at Markham Rd', 'Hwy 401 at Hwy 410', 'Hwy 400 at Hwy 407', 'Hwy 427 at QEW', 'Don Valley Parkway', 'Hwy 404 at Hwy 7'];
+    for (let i = 0; i < nAcc; i++) {
+      const free = HOTSPOTS.filter((x) => BUSY.includes(x.name) && !used.has(x.name));
+      h = free.length ? pick(free) : spot();
+      used.add(h.name);
+      const win = pick([[420, 540], [450, 570], [600, 780], [840, 960]]);
+      const from = win[0] + Math.floor((rnd() * (win[1] - win[0])) / 5) * 5;
+      const dur = 45 + Math.floor(rnd() * 7) * 5;
+      const delay = 20 + Math.floor(rnd() * 4) * 5;
+      add({ kind: 'accident', title: `Collision, ${h.name}`, place: h.name, lat: h.lat, lng: h.lng, radius: 2.5, from, to: from + dur, delay, detail: `Lanes blocked for about ${dur} min (about +${delay} min). Not known in advance.` });
+    }
+    return ev.map((e) => Object.assign(e, { label: EVENT_KINDS[e.kind].label, color: EVENT_KINDS[e.kind].color, known: EVENT_KINDS[e.kind].known }));
+  }
+  // shortest distance (km) from an event's centre to the straight leg a -> b
+  function segDistKm(e, a, b) {
+    const kx = 111.32 * Math.cos((e.lat * Math.PI) / 180), ky = 110.57;
+    const ax = (a.lng - e.lng) * kx, ay = (a.lat - e.lat) * ky, bx = (b.lng - e.lng) * kx, by = (b.lat - e.lat) * ky;
+    const dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy;
+    const f = L ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / L)) : 0;
+    const x = ax + f * dx, y = ay + f * dy;
+    return Math.sqrt(x * x + y * y);
+  }
+  /** Distance and drive time of one leg, plus any delay from events active on it at that time. */
+  function legTime(from, to, depart) {
+    const d = roadKm(from, to);
+    let tt = travelMin(d), km = d, hits = null;
+    const evs = C.eventsActive;
+    if (evs && evs.length && d > 0.2) {
+      for (const e of evs) {
+        if (depart > e.to || depart + tt < e.from) continue;
+        const near = segDistKm(e, from, to);
+        if (near > e.radius) continue;
+        let add;
+        if (e.kind === 'weather') {
+          const inside = Math.min(1, (2 * Math.sqrt(Math.max(0, e.radius * e.radius - near * near))) / Math.max(1, d / ASSUMPTIONS.roadFactor.value));
+          add = Math.max(3, travelMin(d) * e.slow * inside);
+        } else add = e.delay;
+        add = Math.round(add);
+        tt += add;
+        km += e.extraKm || 0;
+        (hits = hits || []).push({ id: e.id, min: add });
+      }
+    }
+    return { d: km, tt, hits };
+  }
   const RUSH = ['RUSH', 'SAME DAY', 'RUSH90', 'EXPEDITE', 'EXCLUSIVE', 'NONSTOP'];
 
   // ------------------------------------------------------------------ geometry
@@ -110,13 +230,17 @@
     t.afterHours = svc.has('AFTER HOURS');
     t.dg = handling.has('dangerous goods');
     t.depotKm = r1(roadKm(depot, t));
-    t.release = t.isPickup && t.dispatchedAt != null && t.dispatchedAt > DAY_START ? t.dispatchedAt : DAY_START;
+    // a pickup can be done once it is booked (night pickups booked the day before are ready at midnight); terminal freight at 06:30
+    t.release = t.isPickup && t.dispatchedAt != null ? Math.max(0, t.dispatchedAt) : DAY_START;
 
     let svcMin = C.serviceBase + Math.max(0, (t.spots || 0) - 2) * 4;
     if (handling.has('inside delivery') || [...handling].some((h) => h.startsWith('helpers'))) svcMin += 15;
     if (handling.has('tailgate')) svcMin += 10;
     if (handling.has('residential')) svcMin += 10;
     t.serviceMin = Math.min(75, svcMin);
+    // learned stop time: median time on site at this customer on OTHER days (Samsara geofence), 5–90 min
+    t.svcSource = 'rule';
+    if (raw.histSvc != null) { t.serviceMin = raw.histSvc; t.svcSource = 'history'; t.svcVisits = raw.histSvcN; }
 
     // terminal freight is loaded the night before: a delivery can start as soon as the truck gets there
     t.earliest = t.isPickup ? t.release : 0;
@@ -145,6 +269,9 @@
   function buildProblem(day, depot, cfg) {
     depot = depot || DEPOT_DEFAULT;
     if (cfg) C = cfg;
+    // events switched on: plan with the ones known in advance; accidents are added after planning
+    C.eventList = C.settings.events === 'on' && day.date ? eventsForDay(day.date) : [];
+    C.eventsActive = C.eventList.filter((e) => e.known);
     const tasks = {};
     day.tasks.forEach((raw) => (tasks[raw.id] = prepTask(raw, depot)));
     const inUnit = new Set();
@@ -232,10 +359,11 @@
       const l = segmentLoad(0);
       loadW += l.w; loadS += l.s;
       if (!st.started) {
-        // depart at 07:00, or earlier (not before 05:00) when the first stop has an early hard window
+        // depart at 07:00, or earlier (early-start shift, not before 03:30) when the first stop has an early hard window
         const first = typeof seq[0] === 'string' ? P.tasks[seq[0]] : null;
-        let dep = Math.max(time, C.depart);
-        if (first && first.hardLatest != null) {
+        // George's routes leave when his drivers really left (first GPS arrival minus the drive); the copilot plans its own start
+        let dep = st.fixedDepart != null ? st.fixedDepart : Math.max(time, C.depart);
+        if (st.fixedDepart == null && first && first.hardLatest != null) {
           const need = first.hardLatest - travelMin(roadKm(depot, first)) - 10;
           if (need < dep) dep = Math.max(EARLIEST_DEPART, need, st.time === C.depart ? EARLIEST_DEPART : st.time);
         }
@@ -258,18 +386,18 @@
       const item = seq[i];
       if (typeof item !== 'string') {
         if (!seq.slice(i + 1).some((x) => typeof x === 'string')) continue; // trailing terminal visit: nothing to reload
-        const d = roadKm(pos, depot), tt = travelMin(d);
+        const lg = legTime(pos, depot, time), d = lg.d, tt = lg.tt;
         const arr = time + tt;
         time = Math.max(arr, item.at || 0) + RELOAD;
         drive += tt; km += d; pos = depot;
         const l = segmentLoad(i + 1);
         loadW = l.w; loadS = l.s;
         maxW = Math.max(maxW, loadW); maxS = Math.max(maxS, loadS);
-        stops.push({ depot: true, arr: Math.round(arr), dep: Math.round(time), loadW: Math.round(loadW), loadS: r1(loadS), legKm: r1(d) });
+        stops.push(Object.assign({ depot: true, arr: Math.round(arr), dep: Math.round(time), loadW: Math.round(loadW), loadS: r1(loadS), legKm: r1(d) }, lg.hits ? { ev: lg.hits } : {}));
         continue;
       }
       const t = P.tasks[item];
-      const d = roadKm(pos, t), tt = travelMin(d);
+      const lg = legTime(pos, t, time), d = lg.d, tt = lg.tt;
       time += tt; drive += tt; km += d;
       const arr = time;
       if (time < t.earliest) { wait += t.earliest - time; time = t.earliest; }
@@ -286,13 +414,13 @@
       loadW = Math.max(0, loadW); loadS = Math.max(0, loadS);
       maxW = Math.max(maxW, loadW); maxS = Math.max(maxS, loadS);
       seen.add(item);
-      stops.push({ id: item, arr: Math.round(arr), start: Math.round(start), dep: Math.round(time), wait: Math.round(start - arr), late: Math.round(lateBy), loadW: Math.round(loadW), loadS: r1(loadS), legKm: r1(d) });
+      stops.push(Object.assign({ id: item, arr: Math.round(arr), start: Math.round(start), dep: Math.round(time), wait: Math.round(start - arr), late: Math.round(lateBy), loadW: Math.round(loadW), loadS: r1(loadS), legKm: r1(d) }, lg.hits ? { ev: lg.hits } : {}));
       pos = t;
     }
     let end = time;
     if (seq.length || !st.atDepot) {
-      const d = roadKm(pos, depot), tt = travelMin(d);
-      end = time + tt; drive += tt; km += d;
+      const lg = legTime(pos, depot, time);
+      end = time + lg.tt; drive += lg.tt; km += lg.d;
     }
     const used = seq.length > 0 || route.done.length > 0;
     const onDuty = used ? end + POSTTRIP - dutyStart : 0;
@@ -478,6 +606,11 @@
     const all = stops.filter((s) => !s.depot).map((s) => s.id);
     const used = all.length > 0;
     const full = used ? simulateFromScratchKpis(P, r, sim) : null;
+    if (used) stops.forEach((s, i) => {
+      if (s.depot) return;
+      const t = P.tasks[s.id];
+      if (t && (s.late > 0 || (t.hardLatest != null && s.start > t.hardLatest - 15))) s.why = whyLate(P, stops, i, full.dutyStart);
+    });
     return {
       id: r.id, driver: r.driver, driverName: r.driverName, vehicle: r.vehicle, cls: r.cls, vehicleLabel: v.label,
       licence: r.licence, vehicleUnknown: r.vehicleUnknown, broken: r.broken || false,
@@ -494,6 +627,90 @@
       violations: sim.viol,
       loadPlan: used ? loadPlan(P, r, stops) : null,
     };
+  }
+
+  const CAUSES = {
+    booking: 'Booked too late',
+    event: 'Road & weather event',
+    sequence: 'Other stops came first',
+    start: 'Truck left too late',
+    tight: 'On time, but tight',
+  };
+  /** Why a stop is late (or only just on time): splits the time from departure to arrival and names the main cause. */
+  function whyLate(P, stops, i, dutyStart) {
+    const s = stops[i], t = P.tasks[s.id];
+    const appt = t.hardLatest != null;
+    const deadline = appt ? t.hardLatest : t.latest;
+    const by = Math.round(s.start - deadline);
+    const depart = dutyStart + PRETRIP;
+    let onSite = 0, waiting = 0, reloads = 0, evMin = 0;
+    const earlier = [], evs = {};
+    for (let k = 0; k < i; k++) {
+      const x = stops[k];
+      if (x.depot) { reloads += x.dep - x.arr; continue; }
+      const xt = P.tasks[x.id];
+      onSite += x.dep - x.start; waiting += x.wait || 0;
+      earlier.push({ id: x.id, place: (xt && (xt.city || xt.customer)) || x.id, orders: xt ? xt.orders : [], minutes: Math.round(x.dep - x.start), full: !!(xt && xt.spots >= 20) });
+    }
+    for (let k = 0; k <= i; k++) for (const h of stops[k].ev || []) { evMin += h.min; evs[h.id] = (evs[h.id] || 0) + h.min; }
+    const driving = Math.max(0, s.arr - depart - onSite - waiting - reloads - evMin);
+    const direct = travelMin(roadKm(P.depot, t));
+    const directArr = Math.round((t.isPickup ? Math.max(t.release, depart) : depart) + direct);
+    const events = Object.entries(evs).map(([id, min]) => {
+      const e = (C.eventList || []).find((x) => x.id === id) || {};
+      return { id, minutes: Math.round(min), title: e.title || id, kind: e.kind || 'event', label: e.label || 'Event', known: !!e.known };
+    }).sort((a, b) => b.minutes - a.minutes);
+    const what = appt ? `the ${hhmm(t.appt)} appointment` : `the ${hhmm(deadline)} promise`;
+    let cause, headline;
+    const knownNote = (e) => (e.known ? (P.kind === 'manual' ? 'It was known in advance, but this plan did not allow for it.' : 'It was known in advance; the copilot planned around it and this was still the best option.') : 'Nobody knew about it in advance.');
+    if (by <= 0) {
+      cause = 'tight';
+      headline = `On time, with ${-by} min to spare before ${hhmm(deadline)}. ${evMin >= 10 ? `${events[0].title} took ${events[0].minutes} min of the buffer.` : earlier.length ? `${earlier.length} earlier stop${earlier.length === 1 ? '' : 's'} on this truck come first.` : directArr >= deadline - 15 ? 'It is the truck’s first stop, so it cannot get there much sooner.' : 'It is the truck’s first stop.'}`;
+    } else if (t.isPickup && t.release + direct > deadline) {
+      cause = 'booking';
+      headline = `The order only arrived at ${hhmm(t.release)} and the stop is ${Math.round(direct)} min from the terminal, so no truck could make ${what}.`;
+    } else if (events.length && evMin >= Math.max(10, by * 0.5)) {
+      cause = 'event';
+      const e = events[0];
+      headline = `${e.title} added ${e.minutes} min${events.length > 1 ? ` (${Math.round(evMin)} min from ${events.length} events)` : ''}. ${knownNote(e)}`;
+    } else if (directArr > deadline) {
+      cause = 'start';
+      headline = `Even as the first stop it would arrive at ${hhmm(directArr)}: the truck left the terminal at ${hhmm(depart)}, too late for ${what}.`;
+    } else {
+      cause = 'sequence';
+      const big = earlier.slice().sort((a, b) => b.minutes - a.minutes)[0];
+      headline = `${earlier.length} earlier stop${earlier.length === 1 ? '' : 's'} on this truck came first${big ? `, the longest ${big.place} (${big.minutes} min on site${big.full ? ', a full load' : ''})` : ''}${reloads ? `, plus ${Math.round(reloads)} min of terminal reloads` : ''}. Sent first, it would have made ${what}.`;
+    }
+    const reasons = [];
+    if (earlier.length) {
+      const big = earlier.slice().sort((a, b) => b.minutes - a.minutes).slice(0, 2);
+      reasons.push(`Before this stop: ${earlier.length} other stop${earlier.length === 1 ? '' : 's'} with ${Math.round(onSite)} min on site, the longest ${big.map((x) => `${x.place} (${x.minutes} min${x.full ? ', full load' : ''})`).join(' and ')}.`);
+    }
+    if (reloads) reasons.push(`Terminal reloads before it: ${Math.round(reloads)} min.`);
+    if (waiting) reasons.push(`Waiting at earlier stops for pickups to be ready: ${Math.round(waiting)} min.`);
+    for (const e of events) reasons.push(`${e.label}: ${e.title}, +${e.minutes} min${e.known ? ' (known in advance)' : ' (not known in advance)'}.`);
+    if (!t.isPickup && t.dispatchedAt != null && t.appt != null && t.dispatchedAt > t.appt) reasons.push(`The delivery was only entered in Elite at ${hhmm(t.dispatchedAt)}, after its appointment.`);
+    if (t.svcSource === 'history' && t.serviceMin >= 45) reasons.push(`Stops at this customer usually take ${Math.round(t.serviceMin)} min (Samsara GPS history).`);
+    return {
+      cause, label: CAUSES[cause], headline, reasons, late: by > 0, by, deadline, deadlineKind: appt ? 'appointment' : 'promise',
+      arr: s.arr, start: s.start, depart, directArr,
+      parts: { driving: Math.round(driving), onSite: Math.round(onSite), reloads: Math.round(reloads), waiting: Math.round(waiting), events: Math.round(evMin) },
+      earlier: earlier.sort((a, b) => b.minutes - a.minutes).slice(0, 3), events,
+    };
+  }
+
+  /** How much each simulated event delayed the plan: stops, trucks and minutes. */
+  function eventImpact(views) {
+    if (!(C.eventList || []).length) return [];
+    const imp = {};
+    for (const v of views) for (const s of v.stops) for (const h of s.ev || []) {
+      const x = (imp[h.id] = imp[h.id] || { stops: 0, minutes: 0, routes: new Set() });
+      x.stops++; x.minutes += h.min; x.routes.add(v.id);
+    }
+    return C.eventList.map((e) => {
+      const x = imp[e.id] || { stops: 0, minutes: 0, routes: new Set() };
+      return Object.assign({}, e, { impact: { stops: x.stops, minutes: Math.round(x.minutes), routes: [...x.routes] } });
+    });
   }
 
   function simulateFromScratchKpis(P, r, sim) {
@@ -569,7 +786,7 @@
     kpis.totalCost = kpis.fleetCost + kpis.partnerCost;
     kpis.equipmentMismatches = views.reduce((a, v) => a + v.violations.filter((x) => x.type === 'equipment').length, 0);
     kpis.overloadedTrucks = views.filter((v) => v.violations.some((x) => x.type === 'overweight' || x.type === 'overspots')).length;
-    return Object.assign({ kpis, routes: views, partner, fleet: fleetMix(P, views) }, extras || {});
+    return Object.assign({ kpis, routes: views, partner, fleet: fleetMix(P, views), events: eventImpact(views) }, extras || {});
   }
 
   /** Per vehicle class: how many units ran, how full they ran and what kind of freight each class carried. */
@@ -606,7 +823,7 @@
   function rebuildPlan(plan, routes, partner) {
     const P = plan._P;
     const keep = {};
-    for (const k of Object.keys(plan)) if (!['kpis', 'routes', 'partner', 'fleet', '_P', '_routes'].includes(k)) keep[k] = plan[k];
+    for (const k of Object.keys(plan)) if (!['kpis', 'routes', 'partner', 'fleet', 'events', '_P', '_routes'].includes(k)) keep[k] = plan[k];
     for (const r of routes) evalRoute(P, r);
     const out = summarize(P, routes, partner, keep);
     out._P = P; out._routes = routes;
@@ -675,8 +892,9 @@
   function buildCustomPlan(day, recipe) {
     recipe = recipe || {};
     let plan;
-    if (recipe.base === 'manual') plan = manualPlan(day);
-    else if (recipe.base === 'copilot') plan = planDay(day, { dynamic: true });
+    const evOn = recipe.settings && recipe.settings.events === 'on' ? 'on' : 'off';
+    if (recipe.base === 'manual') plan = manualPlan(day, { events: evOn });
+    else if (recipe.base === 'copilot') plan = planDay(day, { dynamic: true, settings: { events: evOn } });
     else plan = planDay(day, { dynamic: !(recipe.settings && recipe.settings.liveReplay === false), settings: recipe.settings });
     plan.custom = { id: recipe.id, name: recipe.name || 'Custom plan', base: recipe.base || 'optimise', settings: plan._P.cfg.settings, objective: Object.assign({ key: plan._P.cfg.objective }, OBJECTIVES[plan._P.cfg.objective]), moves: [], edits: [], created: recipe.created };
     for (const m of recipe.moves || []) {
@@ -691,7 +909,7 @@
       id: t.id, orders: t.orders, kind: t.kind, customer: t.customer, address: t.address, city: t.city, prov: t.prov,
       lat: t.lat, lng: t.lng, weight: t.weight, pieces: t.pieces, pieceType: t.pieceType, spots: t.spots, feet: t.feet,
       service: t.service, equipment: t.equipment, handling: t.handling, appt: t.appt, release: t.release,
-      earliest: t.earliest, latest: t.latest, hardLatest: t.hardLatest, serviceMin: t.serviceMin,
+      earliest: t.earliest, latest: t.latest, hardLatest: t.hardLatest, serviceMin: t.serviceMin, svcSource: t.svcSource, svcVisits: t.svcVisits || 0,
       allowed: t.allowed, estimated: t.estimated, issues: t.issues, pairedWith: t.pairedWith || null, dg: t.dg,
       depotKm: t.depotKm, hist: t.hist,
     };
@@ -702,6 +920,7 @@
     options = options || {};
     const t0 = Date.now();
     const P = buildProblem(day, options.depot, makeCfg(options.settings));
+    P.kind = 'plan';
     const decisions = [];
     const log = (d) => decisions.push(Object.assign({ seq: decisions.length + 1 }, d));
     const include = P.cfg.settings.drivers;
@@ -761,6 +980,8 @@
       }
     }
     for (const r of routes) unfreeze(P, r);
+    // accidents were not known when planning: they still happen to the finished plan
+    if (P.cfg.eventList.length) { P.cfg.eventsActive = P.cfg.eventList; for (const r of routes) evalRoute(P, r); }
     const out = summarize(P, routes, partner, {
       date: day.date, mode: options.dynamic ? 'dynamic' : 'static', settings: P.cfg.settings,
       decisions, live, morningKpis: morning.kpis,
@@ -836,7 +1057,9 @@
   // ------------------------------------------------------------------ manual (as dispatched) baseline
   function manualPlan(day, options) {
     options = options || {};
-    const P = buildProblem(day, options.depot, makeCfg());
+    const P = buildProblem(day, options.depot, makeCfg({ events: options.events }));
+    P.cfg.eventsActive = P.cfg.eventList;
+    P.kind = 'manual';
     const byDriver = {};
     for (const t of Object.values(P.tasks)) {
       const code = t.hist.driver;
@@ -856,6 +1079,8 @@
         r.seq.push(t.id); prevRoute = t.hist.route;
       }
       r.state.time = C.depart;
+      const f0 = list.find((t) => t.hist.arr != null);
+      if (f0) r.state.fixedDepart = Math.max(0, Math.min(1200, Math.round(f0.hist.arr - travelMin(roadKm(P.depot, f0)))));
       r.softAppointments = true;
       r.actual = d.actual || null;
       evalRoute(P, r);
@@ -885,9 +1110,12 @@
       for (const s of r.stops) {
         if (s.depot) continue;
         const t = P.tasks[s.id];
-        if (t.hardLatest != null && s.start > t.hardLatest + 0.5) add('critical', 'Delivery window', `Appointment missed: ${t.orders.join(', ')}`, `${t.customer}, ${t.city || ''}: appointment ${hhmm(t.appt)}, modelled arrival ${hhmm(s.arr)} on ${r.id} (${Math.round(s.start - t.appt)} min late).`, 'Re-sequence, swap to a closer route, or call the customer to rebook now.', { route: r.id, task: s.id });
-        else if (t.hardLatest != null && t.hardLatest - s.start < 15) add('warning', 'Delivery window', `Tight appointment: ${t.orders.join(', ')}`, `Arrival ${hhmm(s.start)} vs latest ${hhmm(t.hardLatest)} — less than 15 min buffer.`, 'Keep this stop early or warn the receiver.', { route: r.id, task: s.id });
-        else if (s.late > 30) add('warning', 'Service promise', `${t.orders.join(', ')} ${s.late} min past promise`, `${(t.service || []).join(', ')} promise ${hhmm(t.latest)}, modelled ${hhmm(s.start)} on ${r.id}.`, 'Prioritise or move to a route with slack.', { route: r.id, task: s.id });
+        // only a pickup becomes known when it is dispatched; delivery freight is already in the terminal, so a missed delivery is a real miss
+        const bookedTooLate = t.isPickup && t.appt != null && t.dispatchedAt != null && t.appt - t.dispatchedAt < 30;
+        if (t.hardLatest != null && s.start > t.hardLatest + 0.5 && bookedTooLate) add('warning', 'Delivery window', `Appointment impossible when booked: ${t.orders.join(', ')}`, `${t.customer}, ${t.city || ''}: dispatched at ${hhmm(t.dispatchedAt)} for a ${hhmm(t.appt)} appointment (${Math.max(0, Math.round(t.appt - t.dispatchedAt))} min notice). Earliest modelled arrival ${hhmm(s.arr)} on ${r.id}.`, 'No truck can make it: call the customer to rebook as soon as the order arrives.', { route: r.id, task: s.id });
+        else if (t.hardLatest != null && s.start > t.hardLatest + 0.5) add('critical', 'Delivery window', `Appointment missed: ${t.orders.join(', ')}`, `${t.customer}, ${t.city || ''}: appointment ${hhmm(t.appt)}, modelled arrival ${hhmm(s.arr)} on ${r.id} (${Math.round(s.start - t.appt)} min late).`, s.why && s.why.cause === 'event' ? 'Send the receiver a new ETA now, or move the stop to a truck that avoids the event.' : 'Re-sequence, swap to a closer route, or call the customer to rebook now.', { route: r.id, task: s.id, why: s.why });
+        else if (t.hardLatest != null && t.hardLatest - s.start < 15) add('warning', 'Delivery window', `Tight appointment: ${t.orders.join(', ')}`, `Arrival ${hhmm(s.start)} vs latest ${hhmm(t.hardLatest)} — less than 15 min buffer.`, 'Keep this stop early or warn the receiver.', { route: r.id, task: s.id, why: s.why });
+        else if (s.late > 30) add('warning', 'Service promise', `${t.orders.join(', ')} ${s.late} min past promise`, `${(t.service || []).join(', ')} promise ${hhmm(t.latest)}, modelled ${hhmm(s.start)} on ${r.id}.`, 'Prioritise or move to a route with slack.', { route: r.id, task: s.id, why: s.why });
         if (t.dg && r.cls === 'CARGO_VAN') add('critical', 'Dangerous goods', `Dangerous goods on a van: ${t.orders.join(', ')}`, 'TDG shipments should move in a commercial unit with documents and securement.', 'Reassign to a straight truck.', { route: r.id, task: s.id });
       }
       if (r.loadPlan && r.loadPlan.items.some((i) => i.dg)) {
@@ -896,6 +1124,13 @@
       }
       if (r.vehicleUnknown) add('warning', 'Missing data', `${r.driverName} has no vehicle on record`, 'No unit in the vehicle log or HOS log for this driver-day; capacity assumed to be a 26′ straight truck.', 'Record the unit in Samsara before dispatch.', { route: r.id });
       if (r.utilLb < 15 && r.nStops <= 2 && which === 'manual') add('info', 'Utilization', `${r.id} (${r.driverName}) under-used`, `${r.nStops} stop(s), peak ${r.utilLb}% of payload.`, 'Candidate to consolidate into a neighbouring route.', { route: r.id });
+    }
+    // simulated road & weather events and what they did to this plan
+    for (const e of plan.events || []) {
+      if (!e.impact.stops) continue;
+      const avoided = e.known && which !== 'manual';
+      add(e.kind === 'accident' ? 'warning' : 'info', 'Road & weather', `${e.label}: ${e.title}`, `${hhmm(e.from)}–${hhmm(e.to)} · delayed ${e.impact.stops} stop${e.impact.stops === 1 ? '' : 's'} on ${e.impact.routes.length} truck${e.impact.routes.length === 1 ? '' : 's'} by ${e.impact.minutes} min in total (${e.impact.routes.slice(0, 6).join(', ')}${e.impact.routes.length > 6 ? '…' : ''}). Simulated event.`,
+        e.known ? (avoided ? 'Known in advance: the plan already allows for it, and ETAs include the delay.' : 'Known in advance, but this plan did not allow for it.') : 'Not known in advance: re-plan the affected trucks in Adapt and send customers new ETAs.', { event: e.id });
     }
     // consolidation: same address split across drivers
     const byAddr = {};
@@ -1136,6 +1371,95 @@
         const quote = partnerQuote(pick, P.depot) + 90;
         mk(letters[cands.length] || 'D', 'Same-day partner courier', rs, base.partner.concat([{ unit: 'UHOT', tasks: [pick.id, drop.id], quote, reason: 'Hot shipment' }]), [`Book a partner courier — est. $${quote}`, 'No change to any route'], 'Fallback when no route has the hours or space; keeps the fleet plan untouched.', {});
       }
+    } else if (event.type === 'delay') {
+      // driver-reported delay: heavy traffic, road closed (detour) or hazardous conditions
+      const rid = event.route;
+      const dmin = Math.max(5, Math.min(240, Math.round(Number(event.delayMin) || 45)));
+      // one report can combine several conditions, e.g. heavy traffic and a road closure
+      const reasons = (Array.isArray(event.reasons) && event.reasons.length ? event.reasons : [event.reason || 'traffic']).filter((x) => ['traffic', 'road_closed', 'hazard'].includes(x));
+      if (!reasons.length) reasons.push('traffic');
+      const extraKm = reasons.includes('road_closed') ? Math.max(0, Number(event.extraKm) || 12) : 0;
+      const names = { traffic: 'heavy traffic', road_closed: 'a road closure', hazard: 'hazardous conditions' };
+      const what = reasons.map((x) => names[x]).join(' and ');
+      const delayed = (rs) => {
+        const r = rs.find((x) => x.id === rid);
+        if (!r) return null;
+        r.state.time += dmin;
+        if (reasons.some((x) => x !== 'hazard')) r.state.drive += dmin; // stuck in traffic or on a detour counts as driving
+        r.state.km += extraKm;
+        r.sim = null; evalRoute(P, r);
+        return r;
+      };
+      const lateIds = (r) => (r.sim ? r.sim.stops : []).filter((s) => !s.depot && (s.late > 0 || (P.tasks[s.id].hardLatest != null && s.start > P.tasks[s.id].hardLatest + 0.5))).map((s) => s.id);
+      const wasLate = (() => { const r0 = freshRoutes().find((x) => x.id === rid); return new Set(r0 ? lateIds(r0) : []); })();
+      // ---- A: keep the plan, send customers new ETAs
+      {
+        const rs = freshRoutes();
+        const r = delayed(rs);
+        const late = r ? lateIds(r).filter((id) => !wasLate.has(id)) : [];
+        const pending = r ? r.seq.filter((x) => typeof x === 'string').length : 0;
+        mk('A', 'Keep the plan, send new ETAs', rs, base.partner.slice(), [
+          `${r ? r.driverName : 'The driver'} continues the same ${pending} stop(s), about ${dmin} min behind${extraKm ? ` with a ${extraKm} km detour` : ''}`,
+          `Send updated ETAs to the ${pending} customer(s) still ahead${late.length ? `; ${late.length} will now miss their promise or window` : ''}`,
+          r && r.sim ? `${r.id} now ends at ${hhmm(r.sim.end)}, ${r1(r.sim.onDuty / 60)} h on duty` : 'Route ends later',
+        ], 'No other driver is touched. Best when the delay is short and nobody has a tight window.', { route: rid });
+      }
+      // stops that can still change trucks: whole shipments not yet picked up or loaded
+      const movable = (r) => {
+        const onboard = new Set(r.state.onboard || []);
+        const ids = r.seq.filter((x) => typeof x === 'string');
+        const units = [];
+        for (const id of ids) {
+          const u = P.unitOf[id];
+          if (!u || units.includes(u)) continue;
+          if (u.tasks.every((tid) => ids.includes(tid) && !onboard.has(tid)) && !(r.state.started && u.tasks.some((tid) => terminalDrop(P, tid, r, new Set(ids))))) units.push(u);
+        }
+        return units;
+      };
+      let atRisk = [];
+      {
+        const probe = freshRoutes();
+        const r = delayed(probe);
+        if (r) {
+          const late = new Set(lateIds(r).filter((id) => !wasLate.has(id)));
+          const units = movable(r);
+          atRisk = units.filter((u) => u.tasks.some((tid) => late.has(tid)));
+          if (!atRisk.length && late.size) atRisk = units.slice(-2); // free up time for the stops that cannot move
+        }
+      }
+      // ---- B: hand the at-risk shipments to routes with slack
+      if (atRisk.length) {
+        const rs = freshRoutes();
+        const r = delayed(rs);
+        const moveIds = new Set(atRisk.flatMap((u) => u.tasks));
+        r.seq = r.seq.filter((x) => typeof x !== 'string' || !moveIds.has(x));
+        evalRoute(P, r);
+        const others = rs.filter((x) => x !== r && !x.broken);
+        const before = new Map(others.map((x) => [x.id, x.seq.length]));
+        const failed = retrySoftNoLog(P, others, regretInsert(P, others, atRisk.map((u) => u), { softAppointments: false }));
+        const partner = base.partner.slice();
+        for (const u of failed) partner.push({ unit: u.id, tasks: u.tasks, quote: u.tasks.reduce((a, id) => a + partnerQuote(P.tasks[id], P.depot), 0), reason: `No in-house slack after ${what}.` });
+        const touched = others.filter((x) => x.seq.length !== before.get(x.id)).map((x) => x.id);
+        mk('B', 'Move the at-risk stops to other trucks', rs, partner, [
+          `Take ${atRisk.length} shipment(s) off ${rid} so ${r.driverName} can catch up`,
+          touched.length ? `Re-insert them into ${touched.slice(0, 5).join(', ')}${touched.length > 5 ? '…' : ''}, each where it adds the least cost` : 'No route had room for them',
+          failed.length ? `${failed.length} shipment(s) tendered to a partner carrier` : 'Moved stops respect truck capacity and driver hours',
+        ], 'Protects the delayed driver\'s remaining customers by spreading the work to trucks that have slack.', { touchedRoutes: touched.concat([rid]), route: rid });
+      }
+      // ---- C: partner carrier for the at-risk shipments
+      if (atRisk.length) {
+        const rs = freshRoutes();
+        const r = delayed(rs);
+        const moveIds = new Set(atRisk.flatMap((u) => u.tasks));
+        r.seq = r.seq.filter((x) => typeof x !== 'string' || !moveIds.has(x));
+        evalRoute(P, r);
+        const partner = base.partner.slice();
+        let q = 0;
+        for (const u of atRisk) { const quote = u.tasks.reduce((a, id) => a + partnerQuote(P.tasks[id], P.depot), 0); q += quote; partner.push({ unit: u.id, tasks: u.tasks, quote, reason: `Recovery after ${what}` }); }
+        mk('C', 'Give the at-risk stops to a partner', rs, partner, [`Tender ${atRisk.length} shipment(s) to a partner carrier, est. $${q.toLocaleString()}`, `${rid} keeps the rest of its stops`], 'Leaves every other route untouched. Costs more, and the partner sets the delivery time (assume +3 h).', { route: rid });
+        const o = options_[options_.length - 1];
+        o.delta.lateStops += atRisk.length; o.score += atRisk.length * 150;
+      }
     } else if (event.type === 'failed_delivery') {
       const tid = event.task;
       const rs0 = freshRoutes();
@@ -1181,8 +1505,36 @@
     const best = options_[0];
     const rationale = options_.length > 1
       ? `${best.title} is recommended: ${best.delta.cost >= 0 ? '+' : ''}$${Math.round(best.delta.cost).toLocaleString()} vs plan and ${Math.max(0, best.delta.lateStops)} extra late stop(s), compared with ${options_.slice(1).map((o) => `${o.id} (${o.delta.cost >= 0 ? '+' : ''}$${Math.round(o.delta.cost).toLocaleString()}, ${Math.max(0, o.delta.lateStops)} late)`).join(' and ')}.`
-      : 'Only one feasible option.';
+      : event.type === 'delay' ? 'No customer is at risk from this delay, so the plan stays as it is and customers get updated ETAs.' : 'Only one feasible option.';
     return { event: Object.assign({}, event, { timeLabel: hhmm(t) }), recommended: best.id, rationale, options: options_, baseKpis: baseK };
+  }
+
+  /** A problem reported by a driver from the driver view, turned into a disruption and evaluated. */
+  const REPORT_KINDS = { traffic: 'Heavy traffic', road_closed: 'Road closed', hazard: 'Hazardous conditions', truck: 'Truck problem' };
+  function driverReport(day, plan, rep) {
+    const r = plan.routes.find((x) => x.id === rep.route);
+    if (!r) throw Object.assign(new Error('Unknown route ' + rep.route), { status: 400 });
+    // a driver can tick several problems at once ("kinds"); a single "kind" still works
+    const kinds = [...new Set((Array.isArray(rep.kinds) && rep.kinds.length ? rep.kinds : [rep.kind]).filter(Boolean))];
+    const bad = kinds.filter((k) => !REPORT_KINDS[k]);
+    if (!kinds.length || bad.length) throw Object.assign(new Error('kinds must be one or more of ' + Object.keys(REPORT_KINDS).join(' | ')), { status: 400 });
+    const t = Math.max(360, Math.min(1080, Math.round(Number(rep.time) || 630)));
+    const dm = Math.max(5, Math.min(240, Math.round(Number(rep.delayMin) || 45)));
+    const label = kinds.map((k) => REPORT_KINDS[k]).join(' + ');
+    const list = (xs) => (xs.length > 1 ? xs.slice(0, -1).join(', ') + ' and ' + xs[xs.length - 1] : xs[0]);
+    const road = kinds.filter((k) => k !== 'truck');
+    const phrase = { traffic: 'heavy traffic', road_closed: 'a road closure', hazard: 'hazardous conditions' };
+    // a truck that cannot continue outweighs road conditions: it is handled as a breakdown
+    const event = kinds.includes('truck')
+      ? { type: 'breakdown', route: r.id, time: t, icon: 'wrench', title: `${label} (driver report)`, description: `${r.driverName} on ${r.id} (${r.vehicle}) reported a truck problem${road.length ? ` along with ${list(road.map((k) => phrase[k]))}` : ''} at ${hhmm(t)} and cannot continue.`, source: 'driver' }
+      : { type: 'delay', reason: road[0], reasons: road, route: r.id, time: t, delayMin: dm, extraKm: road.includes('road_closed') ? 12 : 0, icon: 'alert', title: `${label} (driver report)`, description: `${r.driverName} on ${r.id} (${r.vehicle}) reported ${list(road.map((k) => phrase[k]))} at ${hhmm(t)}: about ${dm} min behind${road.includes('road_closed') ? ', with a 12 km detour' : ''}.`, source: 'driver' };
+    const result = Object.assign({ date: day.date }, disrupt(day, event, { basePlan: plan }));
+    const rec = result.options.find((o) => o.id === result.recommended);
+    return {
+      route: r.id, driverName: r.driverName, vehicle: r.vehicle, kind: kinds.includes('truck') ? 'truck' : kinds[0], kinds, label, delayMin: event.delayMin || null,
+      time: t, timeLabel: hhmm(t), title: event.title, description: event.description,
+      recommendation: rec ? `${rec.id}. ${rec.title}` : '', rationale: result.rationale, result,
+    };
   }
 
   function retrySoftNoLog(P, routes, failed) {
@@ -1233,5 +1585,5 @@
     return out;
   }
 
-  return { VEHICLES, ASSUMPTIONS, OBJECTIVES, DEFAULT_SETTINGS, buildCustomPlan, moveStop, planDay, manualPlan, detectConflicts, disrupt, scenarioCatalog, toDispatchRows, toCSV, publicPlan, hhmm, partnerQuote };
+  return { VEHICLES, ASSUMPTIONS, OBJECTIVES, DEFAULT_SETTINGS, EVENT_KINDS, eventsForDay, REPORT_KINDS, driverReport, buildCustomPlan, moveStop, planDay, manualPlan, detectConflicts, disrupt, scenarioCatalog, toDispatchRows, toCSV, publicPlan, hhmm, partnerQuote };
 });

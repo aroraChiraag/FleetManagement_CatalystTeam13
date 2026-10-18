@@ -12,6 +12,7 @@ The copilot does three things:
 1. **Plan the day.** It assigns every leg to a compatible truck and driver, sequences the stops, builds a LIFO load plan, and decides when to tender to a partner carrier.
 2. **Identify problems.** It catches overloads, wrong equipment, missed appointments, HOS breaches, dangerous-goods issues and missing data before trucks leave.
 3. **Adapt.** For a breakdown, a sick call, a rush order or a failed delivery, it returns ranked, costed recovery options in milliseconds.
+4. **Connect drivers and dispatch.** In the phone-friendly **Driver view**, a driver taps *Report a problem* (heavy traffic, road closed, hazardous conditions, truck problem). The copilot re-plans at once, the driver sees new ETAs, and an alert pops up for the dispatcher with the recommended fix.
 
 Every recommendation comes with a reason, and every estimate is labelled.
 
@@ -23,7 +24,7 @@ Requires Node 18+. There are no npm dependencies.
 node server.js
 ```
 
-Open http://localhost:8080. On first start the server plans all 10 days, which takes about 15 s in the background.
+Open http://localhost:8080. On first start the server plans all 10 days, which takes about 15 s in the background. The status dot re-checks the API every 15 seconds: green means connected, red means the server stopped answering (with a message and automatic reconnect), amber means no server was found and the planner runs in the browser.
 
 ## Demo script (5 minutes)
 
@@ -35,6 +36,7 @@ Open http://localhost:8080. On first start the server plans all 10 days, which t
 | 3 | Click a route | Stop timeline with windows, the **LIFO deck plan** for the dock, and "why this route" decisions |
 | 4 | **Problems** | As dispatched vs copilot: missed appointments, overloads, HOS breaches, data gaps, each with a suggested fix |
 | 5 | **Adapt** | Truck breakdown mid-route: three costed options, then **Apply**. The plan updates and the decision downloads as JSON |
+| 5b | **Driver view** (on a phone or a narrow window) | Pick R20 at 10:00, tap **Heavy traffic** (tick more than one problem if you like), **45 min**, **Send to dispatch**. New ETAs appear for the driver; on the dispatcher's screen an alert offers **Review options** |
 | 6 | **API & Exports** | Live "Try" console, dispatch CSV, decision log CSV, OpenAPI spec |
 
 ## Results on the real export (20 Sep – 3 Oct 2026, 10 operating days)
@@ -43,16 +45,24 @@ Both plans are scored with the same distance, time and cost model.
 
 | | As dispatched | Copilot |
 |---|---|---|
-| Truck floor space used | 60% | 82% |
-| Stops per 53′ trailer / straight truck / van | 3.6 / 7.3 / 4.0 | 10.2 / 8.9 / 6.4 |
+| Truck floor space used | 60% | 75% |
+| Stops per 53′ trailer / straight truck / van | 3.6 / 7.3 / 4.0 | 8.9 / 8.1 / 5.4 |
 | Overloaded or wrong-vehicle trucks (10 days) | 88 | 0 |
-| Trucks in service per day | 40–46 | 24–29 (the rest on standby) |
-| Distance | baseline | about 21% less (18,500 km) |
-| Stops on time | 95.4% | 99.1% |
-| Operating cost | baseline | about 22% less ($54.7k over 10 days) |
-| Hard rule violations (capacity, HOS, equipment, appointments) | several per day | 0 |
+| Trucks in service per day | 40–46 | about 30 (the rest on standby) |
+| Distance | baseline | about 15% less (13,600 km) |
+| Stops on time | 93.8% | 99.3% |
+| Operating cost | baseline | about 14% less ($32.6k over 10 days); lower on 9 of the 10 days |
+| Driver hours | 3,837 h | 3,010 h (827 h freed) |
+| Capacity, HOS and equipment violations | several per day | 0 |
+| Critical problems found (10 days) | 183 | 4 |
 
 The pitch page computes these numbers live from `/api/v1/summary`.
+
+**Stop times are learned from history.** Each stop takes the median time Samsara GPS recorded at that customer on *other* days (5 to 90 min), so routes are sized for how long stops really take. About 60% of stops have a learned time; customers with no visit on another day use the 15 min + extras rule. Both plans use the same stop times.
+
+**Where the cost saving comes from.** Most of it is driver hours: about 830 hours freed over 10 days because fewer trucks are needed. If those drivers stay on payroll, treat this as capacity for growth, call-ins and less overtime rather than cash; the "Use the whole fleet" plan keeps every truck working.
+
+**Distance reality check.** Our model estimates George's plan at 89,438 km over the 10 days. The trucks' own Samsara logbooks recorded 99,003 km, so the model is about 10% *below* reality and the distance and cost savings are conservative. Route GPS (61,840 km) is lower still because it only counts driving inside Samsara routes. The Data & Assumptions page shows this check for each day.
 
 **Why fewer trucks?** Each load is matched to the vehicle type that fits it:
 
@@ -60,7 +70,7 @@ The pitch page computes these numbers live from `/api/v1/summary`.
 - Straight trucks take the city multi-drop, tailgate and residential work.
 - The van takes small rush parcels.
 
-Nothing is overloaded or on the wrong equipment, so the same freight fits on fewer units, and roughly 16 trucks a day stay free for breakdowns and call-ins. If you'd rather keep every truck rolling, a custom plan with **Use the whole fleet** spreads the work across all units (for example, 37 trucks on 22 Sep at about +$1.9k).
+Nothing is overloaded or on the wrong equipment, so the same freight fits on fewer units, and roughly 13 trucks a day stay free for breakdowns and call-ins. If you'd rather keep every truck rolling, a custom plan with **Use the whole fleet** spreads the work across all units (for example, 38 trucks on 22 Sep at about +$375, with every appointment met).
 
 ## API
 
@@ -85,6 +95,9 @@ The base path is `/api/v1`. Send the header `X-API-Key: toe-demo-2026`; `?api_ke
 | POST | `/plans/{date}/{id}/undo` | undo the last edit |
 | GET | `/scenarios/{date}` | ready-made disruption scenarios |
 | POST | `/disruptions/{date}` | `{type, route?, time?, pickup?, task?}` → ranked recovery options |
+| POST | `/reports/{date}` | driver reports a problem `{route, kind: traffic\|road_closed\|hazard\|truck, delayMin, time}` → recovery options |
+| GET | `/reports/{date}` | driver reports for the day (dispatcher alerts) |
+| GET / DELETE | `/reports/{date}/{id}` | one report with its options / dismiss it |
 | GET | `/assumptions` | every modelling assumption *(no key)* |
 | GET | `/openapi.json` | OpenAPI 3 spec *(no key)* |
 
@@ -121,6 +134,13 @@ All of these are also listed on the **Data & Assumptions** page:
 - Vehicle class is inferred from the unit name: straight 26′ (10,000 lb / 12 spots), 53′ trailer (48,000 lb / 26 spots), van (2,500 lb / 2 spots).
 - Driver licence is inferred: AZ if the driver was ever seen in a tractor, otherwise DZ.
 - Skid spots are blank in Elite for about 65% of stops. They are estimated from weight and piece type and tagged **EST**.
+- Copilot trucks leave at 07:00, or on an early-start shift from 03:30 when the first stop has an early appointment (drivers in the export left as early as 03:36).
+- George's as-dispatched routes leave when each driver really left (first GPS arrival minus the modelled drive), including night starts, and pickups booked the day before are ready from midnight. On 10 days of GPS the rebuilt routes arrive within about 50 minutes of the real arrival on average.
+- Every late or tight stop carries an explanation: the main cause (booked too late, other stops came first, truck left too late, road & weather event) and how the time from departure to arrival adds up.
+- Simulated road & weather events (top-bar switch, off by default): a planned ramp closure, construction, a weather band, event traffic and one or two accidents per day. The copilot plans around the ones known in advance; accidents hit every plan. Headline results are computed with events off.
+- A pickup booked less than 30 minutes before its appointment is flagged as impossible to meet (a rebooking warning), not as a planning miss. Deliveries are not exempt: their freight is already in the terminal, so a missed delivery appointment counts as a real miss.
 - Terminal freight is loaded before departure. Pickups become known only at their Elite dispatch time.
 - Costs are indicative: $34/h driver with an 8 h minimum, $/km by vehicle class, and formula-based partner quotes.
+- Live traffic is not connected in the prototype: the driver reports the delay. In production, Google Routes or Samsara traffic data would raise the same alert automatically.
+- A reported delay starts counting from the truck's next departure; a road closure adds a 12 km detour.
 - Customer names are pseudonymised in the source export. Addresses, orders, drivers and times are real.

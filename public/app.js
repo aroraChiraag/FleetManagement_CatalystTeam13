@@ -45,9 +45,10 @@
         const E = window.CopilotEngine;
         const memo = {};
         const m = (k, f) => (memo[k] = memo[k] || f());
-        const plan = (d) => m('p' + d, () => E.planDay(ds.days[d], { dynamic: true }));
-        const manual = (d) => m('m' + d, () => E.manualPlan(ds.days[d]));
-        this.local = { ds, E, plan, manual, m, recipes: [], custom: {} };
+        const ev = () => !!(Data.local && Data.local.ev);
+        const plan = (d) => m('p' + d + (ev() ? 'e' : ''), () => E.planDay(ds.days[d], { dynamic: true, settings: ev() ? { events: 'on' } : undefined }));
+        const manual = (d) => m('m' + d + (ev() ? 'e' : ''), () => E.manualPlan(ds.days[d], { events: ev() ? 'on' : 'off' }));
+        this.local = { ds, E, plan, manual, m, recipes: [], custom: {}, reports: {}, reportSeq: 0 };
         const dates = Object.keys(ds.days).sort();
         this.health = { dates, defaultDate: dates.includes('2026-09-22') ? '2026-09-22' : dates[0], dataset: ds.meta };
       }
@@ -55,7 +56,8 @@
     },
     async get(path) {
       if (this.mode === 'api') {
-        const r = await fetch('api/v1/' + path, { headers: { 'X-API-Key': API_KEY } });
+        const r = await fetch('api/v1/' + withEvents(path), { headers: { 'X-API-Key': API_KEY } }).catch(() => { Health.fail(); throw new Error('The server is not responding. Check the terminal window running node server.js.'); });
+        if (r.status >= 500) Health.fail();
         if (!r.ok) throw new Error((await r.json()).error || r.statusText);
         return r.json();
       }
@@ -68,19 +70,27 @@
         return r.json();
       }
       const id = path.split('/')[2];
+      if (path.startsWith('reports/')) { const d = path.split('/')[1]; this.local.reports[d] = (this.local.reports[d] || []).filter((x) => x.id !== id); return { deleted: id }; }
       this.local.recipes = this.local.recipes.filter((x) => x.id !== id);
       delete this.local.custom[id];
       return { deleted: id };
     },
     async post(path, body) {
       if (this.mode === 'api') {
-        const r = await fetch('api/v1/' + path, { method: 'POST', headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const r = await fetch('api/v1/' + withEvents(path), { method: 'POST', headers: { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => { Health.fail(); throw new Error('The server is not responding. Check the terminal window running node server.js.'); });
+        if (r.status >= 500) Health.fail();
         if (!r.ok) throw new Error((await r.json()).error || r.statusText);
         return r.json();
       }
+      this.local.ev = S.events;
       const { ds, E, plan } = this.local;
       const d = path.split('/')[1];
       if (path.startsWith('plans/')) return this.localPlans('POST', path.split('?')[0], body);
+      if (path.startsWith('reports/')) {
+        const r = Object.assign({ id: 'RPT-' + String(++this.local.reportSeq).padStart(3, '0'), date: d, createdAt: new Date().toISOString() }, E.driverReport(ds.days[d], plan(d), body));
+        (this.local.reports[d] = this.local.reports[d] || []).unshift(r);
+        return r;
+      }
       const preset = E.scenarioCatalog(plan(d), ds.days[d]).find((s) => s.type === body.type) || {};
       return Object.assign({ date: d }, E.disrupt(ds.days[d], Object.assign({}, preset, body), { basePlan: plan(d) }));
     },
@@ -106,6 +116,8 @@
       throw new Error('unsupported offline: ' + path);
     },
     localGet(path) {
+      this.local.ev = S.events && !path.startsWith('summary');
+      if (path.startsWith('events/')) return { date: path.split('/')[1], simulated: true, events: this.local.E.eventsForDay(path.split('/')[1]) };
       const { ds, E, plan, manual, m } = this.local;
       if (path.startsWith('plans/')) return this.localPlans('GET', path.split('?')[0]);
       if (path.startsWith('fleet/')) { const d = path.split('/')[1]; return { date: d, drivers: ds.days[d].drivers.map((x) => ({ code: x.code, name: x.name, vehicle: x.vehicle, vehicleClass: x.vehicleClass, vehicleLabel: E.VEHICLES[x.vehicleClass].label, licence: x.licence })), objectives: E.OBJECTIVES, defaults: E.DEFAULT_SETTINGS }; }
@@ -117,6 +129,7 @@
         const cnt = (l) => l.reduce((a, x) => ((a[x.severity] = (a[x.severity] || 0) + 1), a), { critical: 0, warning: 0, info: 0 });
         return { date: d, weekday: ds.days[d].weekday, copilot: plan(d).kpis, manual: manual(d).kpis, actual: ds.days[d].actualSummary, morning: plan(d).morningKpis, liveInsertions: plan(d).live.length, conflicts: { copilot: cnt(c), manual: cnt(mc) } };
       };
+      if (parts[0] === 'reports') { const list = this.local.reports[parts[1]] || []; if (parts[2]) return list.find((x) => x.id === parts[2]); return { date: parts[1], reports: list.map(({ result, ...rest }) => rest) }; }
       if (parts[0] === 'assumptions') return { assumptions: E.ASSUMPTIONS, vehicles: E.VEHICLES };
       if (parts[0] === 'summary') return m('summary', () => localSummary(ds, cmp));
       const d = parts[1];
@@ -138,10 +151,46 @@
     const c = agg('copilot'), mm = agg('manual');
     return {
       period: ds.meta.period, days: days.length, history: ds.history, copilot: c, manual: mm,
-      deltas: { kmPct: pct(c.km, mm.km), costPct: pct(c.cost, mm.cost), trucksPct: pct(c.trucks, mm.trucks), dutyPct: pct(c.duty, mm.duty), onTimeCopilot: Math.round(((c.stops - c.late) / c.stops) * 1000) / 10, onTimeManual: Math.round(((mm.stops - mm.late) / mm.stops) * 1000) / 10, kmSaved: mm.km - c.km, costSaved: mm.cost - c.cost, co2Saved: mm.co2 - c.co2, trucksFreedPerDay: Math.round(((mm.trucks - c.trucks) / days.length) * 10) / 10 },
+      deltas: { kmPct: pct(c.km, mm.km), costPct: pct(c.cost, mm.cost), trucksPct: pct(c.trucks, mm.trucks), dutyPct: pct(c.duty, mm.duty), onTimeCopilot: Math.round(((c.stops - c.late) / c.stops) * 1000) / 10, onTimeManual: Math.round(((mm.stops - mm.late) / mm.stops) * 1000) / 10, kmSaved: mm.km - c.km, costSaved: mm.cost - c.cost, co2Saved: mm.co2 - c.co2, logbookKm: sum((d) => (d.actual && d.actual.logbookKm) || 0), manualVsLogbookPct: pct(mm.km, sum((d) => (d.actual && d.actual.logbookKm) || 0)), copilotVsLogbookPct: pct(c.km, sum((d) => (d.actual && d.actual.logbookKm) || 0)), trucksFreedPerDay: Math.round(((mm.trucks - c.trucks) / days.length) * 10) / 10 },
       lateDispatchedPct: Math.round((sum((d) => d.actual.lateDispatched) / sum((d) => d.manual.stopsRouted)) * 100),
       perDay: days.map((d) => ({ date: d.date, weekday: d.weekday, copilot: d.copilot, manual: d.manual, actual: d.actual })),
     };
+  }
+
+  // ------------------------------------------------------------------ live API health (checked every 15 s)
+  const Health = {
+    up: true, timer: null,
+    paint() {
+      const st = $('#apiStatus'); if (!st) return;
+      st.classList.toggle('local', Data.mode === 'local');
+      st.classList.toggle('down', Data.mode === 'api' && !this.up);
+      st.title = Data.mode === 'api' ? (this.up ? 'The server answered the last health check.' : 'The server did not answer. Retrying every 15 seconds.') : 'No server found, so the planner runs inside this browser.';
+      st.querySelector('span').textContent = Data.mode === 'local' ? 'Offline: in-browser engine' : this.up ? 'API connected' : 'API not responding, retrying';
+    },
+    fail() {
+      if (Data.mode !== 'api' || !this.up) return;
+      this.up = false; this.paint();
+      toast('<b>The API stopped responding.</b><br>Check the terminal window running <code>node server.js</code>. Retrying every 15 seconds.', 'bad');
+    },
+    ok() {
+      if (this.up) return;
+      this.up = true; this.paint(); S.cache = {};
+      toast('<b>API connected again.</b> Reloading this page.', 'good'); route();
+    },
+    async check() {
+      try {
+        const r = await fetch('api/v1/health', { cache: 'no-store', signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined });
+        const h = r.ok ? await r.json() : null;
+        if (h && h.status === 'ok') this.ok(); else this.fail();
+      } catch (e) { this.fail(); }
+    },
+    start() { if (Data.mode === 'api' && !this.timer) this.timer = setInterval(() => this.check(), 15000); },
+  };
+
+  // simulated road & weather events: one switch in the top bar, sent as ?events=1 on every call
+  function withEvents(path) {
+    if (!S.events || path.startsWith('summary') || path.startsWith('health')) return path;
+    return path + (path.includes('?') ? '&' : '?') + 'events=1';
   }
 
   // ------------------------------------------------------------------ state
@@ -149,9 +198,10 @@
     date: null, dates: [], cache: {},
     selectedRoute: null, planView: 'copilot', replayT: null, playing: null,
     problemsView: 'manual', problemsFilter: 'All',
-    scenario: null, disruption: null, selectedOption: null, applied: {},
+    scenario: null, disruption: null, selectedOption: null, applied: {}, events: false,
   };
   async function cached(key, fn) {
+    if (S.events && !key.startsWith('cplan:') && key !== 'summary' && key !== 'assumptions') key += '|ev';
     if (!S.cache[key]) S.cache[key] = fn().catch((e) => { delete S.cache[key]; throw e; });
     return S.cache[key];
   }
@@ -163,12 +213,12 @@
   const getSummary = () => cached('summary', () => Data.get('summary'));
   const getPlans = () => cached('plans:' + S.date, () => Data.get('plans/' + S.date));
   const getPlanById = (id) => cached('cplan:' + id, () => Data.get(`plans/${S.date}/${id}`));
-  function invalidatePlans() { delete S.cache['plans:' + S.date]; Object.keys(S.cache).filter((k) => k.startsWith('conf:')).forEach((k) => { if (!/conf:(copilot|manual):/.test(k)) delete S.cache[k]; }); }
+  function invalidatePlans() { delete S.cache['plans:' + S.date]; delete S.cache['plans:' + S.date + '|ev']; Object.keys(S.cache).filter((k) => k.startsWith('conf:')).forEach((k) => { if (!/conf:(copilot|manual):/.test(k)) delete S.cache[k]; }); }
   function setPlanCache(id, plan) { S.cache['cplan:' + id] = Promise.resolve(plan); invalidatePlans(); }
   const getAssumptions = () => cached('assumptions', () => Data.get('assumptions'));
 
   // ------------------------------------------------------------------ router
-  const views = { pitch: viewPitch, plan: viewPlan, problems: viewProblems, adapt: viewAdapt, api: viewApi, assumptions: viewAssumptions };
+  const views = { pitch: viewPitch, plan: viewPlan, problems: viewProblems, adapt: viewAdapt, driver: viewDriver, api: viewApi, assumptions: viewAssumptions };
   let renderToken = 0;
   async function route() {
     const name = (location.hash.replace(/^#\/?/, '').split('?')[0] || 'pitch');
@@ -240,6 +290,7 @@
   let map = null, mapLayers = null;
   function ensureMap(el) {
     if (map) { map.remove(); map = null; }
+    if (!window.L) { if (el) el.innerHTML = '<div class="card empty" style="height:100%;display:grid;place-items:center">Map unavailable: no internet connection to load map tiles. Plans, problems and recovery options still work.</div>'; return false; }
     map = L.map(el, { zoomControl: true, attributionControl: true, preferCanvas: true }).setView([43.75, -79.45], 9);
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors', className: 'muted-tiles' }).addTo(map);
     mapLayers = L.layerGroup().addTo(map);
@@ -247,14 +298,21 @@
   }
   const DEPOT = { lat: 43.80800808529279, lng: -79.24190011829823 };
   function drawRoutes(plan, opts) {
+    if (!map || !window.L) return;
     opts = opts || {};
     if (!map) return;
     mapLayers.clearLayers();
+    (plan.events || []).forEach((e) => {
+      mapLayers.addLayer(L.circle([e.lat, e.lng], { radius: e.radius * 1000, color: e.color, weight: 1.5, dashArray: e.known ? null : '6 5', fillColor: e.color, fillOpacity: 0.07 })
+        .bindPopup(`<b>${esc(e.label)}: ${esc(e.title)}</b><br>${hhmm(e.from)}–${hhmm(e.to)} · ${e.known ? 'known in advance' : 'not known in advance'}<br>${esc(e.detail)}${e.impact ? `<br>Delayed ${e.impact.stops} stop(s) on ${e.impact.routes.length} truck(s), +${e.impact.minutes} min` : ''}<br><i>Simulated event</i>`));
+    });
     const T = taskMap(plan);
     const t = opts.time;
     const bounds = [[DEPOT.lat, DEPOT.lng]];
+    const only = opts.only && opts.only.size ? opts.only : null;
     plan.routes.forEach((r, i) => {
       if (!r.nStops) return;
+      if (only && !only.has(r.id)) return;
       const color = opts.colorOf ? opts.colorOf(r, i) : routeColor(i);
       const sel = S.selectedRoute === r.id || (opts.highlight && opts.highlight.includes(r.id));
       const dim = (S.selectedRoute && !sel && !opts.highlight) || (opts.highlight && !opts.highlight.includes(r.id));
@@ -288,7 +346,7 @@
         mapLayers.addLayer(L.marker(truck, { icon: ic, opacity: dim ? 0.3 : 1, zIndexOffset: 500 }).bindTooltip(`${r.id} ${r.driverName}`));
       }
     });
-    (plan.partner || []).forEach((p) => p.tasks.forEach((id) => {
+    (only ? [] : plan.partner || []).forEach((p) => p.tasks.forEach((id) => {
       const task = T[id];
       if (!task) return;
       mapLayers.addLayer(L.circleMarker([task.lat, task.lng], { radius: 5, color: '#030718', weight: 2, fillColor: '#F2F2F2', fillOpacity: 1, dashArray: '2 2' }).bindPopup(`<b>Partner carrier</b><br>${esc(task.orders.join(', '))} · ${esc(task.city || '')}<br>${esc(p.reason)}<br>Quote $${fmt(p.quote)}`));
@@ -297,7 +355,10 @@
     mapLayers.addLayer(L.marker([DEPOT.lat, DEPOT.lng], { icon: depotIcon, zIndexOffset: 1000 }).bindPopup('<b>Scarborough terminal</b><br>2215 Markham Rd'));
     if (opts.fit !== false) {
       const sr = S.selectedRoute && plan.routes.find((r) => r.id === S.selectedRoute);
-      if (sr) {
+      if (only) {
+        const b = plan.routes.filter((r) => only.has(r.id)).flatMap((r) => r.stops.filter((s) => !s.depot && T[s.id]).map((s) => [T[s.id].lat, T[s.id].lng])).concat([[DEPOT.lat, DEPOT.lng]]);
+        map.fitBounds(b, { padding: [30, 30], maxZoom: 12 });
+      } else if (sr) {
         const b = sr.stops.filter((s) => !s.depot && T[s.id]).map((s) => [T[s.id].lat, T[s.id].lng]).concat([[DEPOT.lat, DEPOT.lng]]);
         map.fitBounds(b, { padding: [30, 30], maxZoom: 12 });
       } else {
@@ -331,7 +392,7 @@
       </div>
       <div class="hero-stats">
         <div class="hs"><b>${d.utilSpotsCopilot}%</b><span>of truck floor space used vs ${d.utilSpotsManual}% as dispatched: every load matched to a 53′ trailer, straight truck or van</span></div>
-        <div class="hs"><b>${fmt(Math.abs(d.kmPct), 0)}%</b><span>less distance driven (${fmt(d.kmSaved)} km over ${sm.days} days)</span></div>
+        <div class="hs"><b>${fmt(Math.abs(d.kmPct), 0)}%</b><span>less distance driven (${fmt(d.kmSaved)} km over ${sm.days} days)${d.logbookKm ? `. Conservative: our estimate of George's plan is ${fmt(Math.abs(d.manualVsLogbookPct), 0)}% below the ${fmt(d.logbookKm)} km the trucks' logbooks recorded` : ''}</span></div>
         <div class="hs"><b>${fmt(d.onTimeCopilot, 1)}%</b><span>stops on time vs ${fmt(d.onTimeManual, 1)}% as dispatched</span></div>
         <div class="hs"><b>${money(d.costSaved)}</b><span>lower operating cost in ${sm.days} operating days (${fmt(Math.abs(d.costPct), 0)}%)</span></div>
         <div class="hs wide"><span>Measured on Trans Ontario's own 20 Sep – 3 Oct 2026 export: ${fmt(h.customer_stops)} customer stops replayed minute by minute, with every call-in pickup entering the plan at the real time George dispatched it in ${ELITE}.</span></div>
@@ -437,6 +498,36 @@
     </section>`;
   }
 
+  // ------------------------------------------------------------------ why a stop is late, and the simulated events
+  const CAUSE_CLASS = { booking: 'warn', event: 'crit', sequence: 'grey', start: 'grey', tight: 'ok' };
+  function whyBar(w) {
+    const parts = [['driving', 'Driving', '#8EA3F5'], ['onSite', 'On site at earlier stops', '#030718'], ['reloads', 'Terminal reloads', '#8A90A2'], ['waiting', 'Waiting', '#D5D9E3'], ['events', 'Road & weather', '#C62828']].filter(([k]) => w.parts[k] > 0);
+    const total = parts.reduce((a, [k]) => a + w.parts[k], 0) || 1;
+    return `<div class="why-bar" title="From terminal departure ${hhmm(w.depart)} to arrival ${hhmm(w.arr)}">${parts.map(([k, l, c]) => `<i style="width:${(w.parts[k] / total) * 100}%;background:${c}" title="${l}: ${w.parts[k]} min"></i>`).join('')}</div>
+      <div class="why-legend">${parts.map(([k, l, c]) => `<span><i style="background:${c}"></i>${l} ${fmt(w.parts[k])} min</span>`).join('')}</div>
+      <div class="small muted">Left the terminal ${hhmm(w.depart)} · arrived ${hhmm(w.arr)} · ${w.deadlineKind === 'appointment' ? 'appointment latest' : 'promised by'} ${hhmm(w.deadline)}${w.cause !== 'tight' && w.directArr ? ` · as the first stop: ${hhmm(w.directArr)}` : ''}</div>`;
+  }
+  function whyBlock(w, open) {
+    if (!w) return '';
+    return `<div class="whybox"><div><span class="chip ${CAUSE_CLASS[w.cause] || 'grey'}">${esc(w.label)}</span> ${w.late ? `<b>${w.by} min late.</b> ` : ''}${esc(w.headline)}</div>
+      <details class="why-more"${open ? ' open' : ''}><summary>How the time adds up</summary>${whyBar(w)}${w.reasons.length ? `<ul>${w.reasons.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}</details></div>`;
+  }
+  function evChips(ev, events) {
+    if (!ev || !ev.length) return '';
+    return ev.map((h) => { const e = (events || []).find((x) => x.id === h.id) || {}; return `<span class="chip" style="background:${e.color || '#C62828'}18;color:${e.color || '#C62828'}" title="${esc(e.title || '')}">${esc(e.label || 'Event')} +${h.min} min</span>`; }).join('');
+  }
+  function eventsCard(plan) {
+    if (!S.events) {
+      return `<div class="card ev-off" style="margin-bottom:16px"><div class="row" style="justify-content:space-between"><div><b>Road &amp; weather events are off.</b> <span class="small muted">Turn them on to stress-test this day with simulated road closures, construction, weather, event traffic and accidents, and see which stops they make late.</span></div><button class="btn ghost sm" data-ev-toggle>Turn on simulated events</button></div></div>`;
+    }
+    const evs = plan.events || [];
+    return `<div class="card" style="margin-bottom:16px">
+      <div class="row" style="justify-content:space-between"><h3 style="margin:0">Road &amp; weather on ${esc(S.date)} <span class="chip est">Simulated</span></h3><span class="small muted">Known events are planned around; accidents are not known in advance.</span></div>
+      <div style="overflow:auto;margin-top:8px"><table class="tbl"><thead><tr><th>Event</th><th>When</th><th>Known?</th><th>Effect on this plan</th></tr></thead><tbody>
+      ${evs.map((e) => `<tr><td><span class="ev-dot" style="background:${e.color}"></span><b>${esc(e.label)}</b><div class="small muted">${esc(e.title)} · ${esc(e.detail)}</div></td><td class="num">${hhmm(e.from)}–${hhmm(e.to)}</td><td>${e.known ? '<span class="chip ok">In advance</span>' : '<span class="chip crit">Surprise</span>'}</td><td>${e.impact && e.impact.stops ? `<b>${e.impact.stops} stop${e.impact.stops === 1 ? '' : 's'}</b> on ${e.impact.routes.length} truck${e.impact.routes.length === 1 ? '' : 's'}, +${fmt(e.impact.minutes)} min<div class="small muted">${esc(e.impact.routes.slice(0, 8).join(', '))}</div>` : '<span class="muted">No truck affected</span>'}</td></tr>`).join('')}
+      </tbody></table></div></div>`;
+  }
+
   // ================================================================== PLAN
   const isDefaultPlan = (id) => id === 'copilot' || id === 'manual';
   async function loadPlanById(id) {
@@ -520,6 +611,12 @@
         ? `Planned at 06:30 with freight already in the terminal and pickups already booked. Then <b>${plan.live.length} call-in pickups</b> were inserted live at the real time George dispatched them in ${ELITE}. Computed in ${fmt(plan.runtimeMs)} ms.`
         : `${base.custom.base === 'optimise' ? `Optimised for <b>${esc(base.custom.objective.label)}</b>: ${esc(base.custom.objective.text)}` : `Copy of the ${base.custom.base === 'manual' ? 'as-dispatched' : 'copilot'} plan, edited by hand.`} Use <b>Move to…</b> on any stop to change it; the impact is checked instantly.`;
     const st = isCustom ? base.custom.settings : null;
+    // drivers picked for the map and the replay (kept per day and plan)
+    const routeIds = shown.routes.filter((r) => r.nStops).map((r) => r.id);
+    const colorOf = Object.fromEntries(shown.routes.map((r, i) => [r.id, routeColor(i)]));
+    if (!S.drvSel || S.drvSelKey !== S.date + '|' + pv) { S.drvSel = new Set(); S.drvSelKey = S.date + '|' + pv; }
+    for (const id of [...S.drvSel]) if (!routeIds.includes(id)) S.drvSel.delete(id);
+    S.playLabel = playLabel();
     $('#view').innerHTML = `
       <div class="page-head">
         <div><div class="eyebrow">Plan the day · ${esc(cmp.weekday)} ${esc(S.date)}</div><h1>${title}</h1><p>${sub}</p>
@@ -536,23 +633,25 @@
       ${applied ? `<div class="banner applied">✓ <span>Showing plan after applying <b>${esc(applied.title)}</b> (${esc(applied.event)}). <a href="#" id="undoApply" style="color:#fff;text-decoration:underline">Revert to the original plan</a></span></div>` : ''}
       ${kpiTiles(c, vs.kpis, { vsLabel, fleet: active.fleet })}
       ${compareCard(plans, pv)}
+      ${isCustom ? '' : eventsCard(active)}
       ${fleetMixCard(active, vs, vsLabel)}
       ${isCustom && base.custom.edits && base.custom.edits.length ? `<div class="card" style="margin-bottom:16px"><h3>Dispatcher edits (${base.custom.edits.length})</h3><ul class="decisions" style="max-height:220px">${base.custom.edits.map((e, i) => `<li><span class="time">#${i + 1}</span><div>${e.error ? `<div class="what">Could not re-apply ${esc(e.task)} → ${esc(e.target)}</div><div class="why">${esc(e.error)}</div>` : `<div class="what">${esc(e.label)} → ${esc(e.target === 'PARTNER' ? 'partner carrier' : e.target)} ${e.brokenRules.length ? `<span class="chip crit">breaks ${esc(e.brokenRules.join(', '))}</span>` : '<span class="chip ok">rules pass</span>'}</div><div class="why">${e.deltaCost >= 0 ? '+' : '−'}$${fmt(Math.abs(e.deltaCost))} day cost · ${e.deltaKm >= 0 ? '+' : '−'}${fmt(Math.abs(e.deltaKm))} km${e.to && e.to.after ? ` · ${esc(e.to.id)} now ends ${hhmm(e.to.after.end)} (${fmt(e.to.after.onDuty / 60, 1)} h on duty)` : ''}</div>`}</div></li>`).join('')}</ul></div>` : ''}
       <div class="plan-layout">
         <div>
+          <div id="drvSel" class="drvsel"></div>
           <div id="map" class="map"></div>
           <div class="replay">
-            <button class="btn sm" id="playBtn">${ICON.play} Replay day</button>
+            <button class="btn sm" id="playBtn">${ICON.play} ${S.playLabel}</button>
             <input type="range" id="tSlider" min="330" max="1320" step="5" value="${S.replayT == null ? 1320 : S.replayT}" aria-label="Time of day" />
             <span class="clock" id="clock">${S.replayT == null ? 'All day' : hhmm(S.replayT)}</span>
           </div>
           <div class="ticker" id="ticker"></div>
         </div>
         <div class="card route-list">
-          <div class="row" style="justify-content:space-between;margin-bottom:8px"><h3 style="margin:0">Routes</h3><span class="muted small">${shown.routes.filter((r) => r.nStops).length} trucks · ${(shown.partner || []).length} partner tenders · click a row</span></div>
-          <table class="tbl"><thead><tr><th></th><th>Route</th><th>Stops</th><th>km</th><th style="min-width:70px">Hours</th><th style="min-width:70px">Weight</th><th style="min-width:70px">Floor</th></tr></thead>
+          <div class="row" style="justify-content:space-between;margin-bottom:8px"><h3 style="margin:0">Routes</h3><span class="muted small">${shown.routes.filter((r) => r.nStops).length} trucks · ${(shown.partner || []).length} partner tenders · tick to show on the map, click a row for details</span></div>
+          <table class="tbl"><thead><tr><th class="pick-cell" title="Show these drivers on the map"><input type="checkbox" id="selAll" aria-label="Select all drivers" /></th><th>Route</th><th>Stops</th><th>km</th><th style="min-width:70px">Hours</th><th style="min-width:70px">Weight</th><th style="min-width:70px">Floor</th></tr></thead>
           <tbody>${shown.routes.map((r, i) => (r.nStops ? `<tr class="click ${S.selectedRoute === r.id ? 'sel' : ''}" data-route="${r.id}">
-              <td><span class="dot" style="background:${routeColor(i)}"></span></td>
+              <td class="pick-cell"><input type="checkbox" data-pick="${r.id}" ${S.drvSel.has(r.id) ? 'checked' : ''} style="accent-color:${routeColor(i)}" aria-label="Show ${esc(r.driverName)} on the map" title="Show on the map" /><span class="dot" style="background:${routeColor(i)}"></span></td>
               <td><b>${r.id}</b> ${r.broken ? '<span class="chip crit">OUT</span>' : ''}${r.violations.some((v) => v.hard) ? '<span class="chip crit">!</span>' : ''}<div class="small muted">${esc(r.driverName)} · ${esc(VEH_SHORT[r.cls] || '')} ${esc((r.vehicle || '').replace(/^(Truck|Tractor) /, ''))}</div></td>
               <td class="num">${r.nStops}${r.stops.some((s) => s.live != null) ? ` <span class="chip live" title="stops inserted live">+${r.stops.filter((s) => s.live != null).length}</span>` : ''}${r.stops.some((s) => s.edited) ? ' <span class="chip warn" title="edited by the dispatcher">✎</span>' : ''}</td>
               <td class="num">${fmt(r.km)}</td>
@@ -566,8 +665,10 @@
       ${(active.decisions || []).length ? `<div class="card" style="margin-top:16px"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Decision log (${active.decisions.length})</h3><div class="row"><div class="filters" id="decFilters" style="margin:0">${['All', 'assign', 'live_insert', 'partner', 'improve', 'manual_edit'].map((f, i) => `<button data-f="${f}" class="${i === 0 ? 'on' : ''}">${{ All: 'All', assign: 'Assign', live_insert: 'Live', partner: 'Partner', improve: 'Improve', manual_edit: 'Edits' }[f]}</button>`).join('')}</div><a class="btn ghost sm" href="api/v1/decisions/${S.date}?format=csv&api_key=${API_KEY}${planQS}">${ICON.down} Save log (CSV)</a></div></div><ul class="decisions" id="decList"></ul></div>` : ''}
     `;
     ensureMap($('#map'));
-    const redraw = (fit) => drawRoutes(shown, { time: S.replayT, onRoute: selectRoute, fit });
+    const redraw = (fit) => drawRoutes(shown, { time: S.replayT, onRoute: selectRoute, fit, only: S.drvSel });
     redraw(true);
+    renderSelBar();
+    syncPicks();
     renderDetail(shown);
     renderDecisions(active, 'All');
     $$('[data-pv]').forEach((b) => b.addEventListener('click', () => { S.planView = b.dataset.pv; S.selectedRoute = null; route(); }));
@@ -587,18 +688,68 @@
     if (exp) exp.addEventListener('click', (e) => { e.preventDefault(); localExport(); });
     const slider = $('#tSlider');
     slider.addEventListener('input', () => { S.replayT = Number(slider.value) >= 1320 ? null : Number(slider.value); $('#clock').textContent = S.replayT == null ? 'All day' : hhmm(S.replayT); redraw(false); renderTicker(active); });
-    $('#playBtn').addEventListener('click', () => {
-      if (S.playing) return stopReplay();
-      if (S.replayT == null || S.replayT >= 1310) S.replayT = 360;
+    $('#playBtn').addEventListener('click', () => { if (S.playing) return stopReplay(); startReplay(); });
+    // picking drivers: tick boxes in the routes list, the header box, or "Show only this driver" in a route's detail
+    $$('.pick-cell').forEach((td) => td.addEventListener('click', (e) => e.stopPropagation()));
+    $$('[data-pick]').forEach((cb) => cb.addEventListener('change', () => { if (cb.checked) S.drvSel.add(cb.dataset.pick); else S.drvSel.delete(cb.dataset.pick); onSelChange(); }));
+    $('#selAll').addEventListener('change', (e) => { if (e.target.checked) routeIds.forEach((id) => S.drvSel.add(id)); else S.drvSel.clear(); onSelChange(); });
+    S._onSelChange = onSelChange;
+
+    function playLabel() {
+      const n = S.drvSel ? S.drvSel.size : 0;
+      return n === 0 || n === routeIds.length ? 'Replay day' : n === 1 ? 'Replay this driver\'s day' : `Replay ${n} drivers' day`;
+    }
+    function syncPicks() {
+      $$('[data-pick]').forEach((cb) => (cb.checked = S.drvSel.has(cb.dataset.pick)));
+      const all = $('#selAll');
+      all.checked = S.drvSel.size > 0 && S.drvSel.size === routeIds.length;
+      all.indeterminate = S.drvSel.size > 0 && S.drvSel.size < routeIds.length;
+    }
+    function onSelChange() {
+      stopReplay();
+      S.replayT = null;
+      slider.value = 1320; $('#clock').textContent = 'All day';
+      S.playLabel = playLabel();
+      $('#playBtn').innerHTML = `${ICON.play} ${S.playLabel}`;
+      syncPicks(); renderSelBar(); redraw(true); renderTicker(active);
+    }
+    function renderSelBar() {
+      const el = $('#drvSel');
+      if (!el) return;
+      if (!S.drvSel.size) {
+        el.innerHTML = `<span class="small muted">Showing all ${routeIds.length} drivers. Tick drivers in the Routes list to see just their day and replay it.</span>`;
+        return;
+      }
+      const rs = shown.routes.filter((r) => S.drvSel.has(r.id));
+      const sum = (f) => rs.reduce((a, r) => a + (f(r) || 0), 0);
+      const live = sum((r) => r.stops.filter((s) => s.live != null).length);
+      const start = Math.min(...rs.map((r) => (r.start == null ? 1440 : r.start)));
+      const end = Math.max(...rs.map((r) => (r.end == null ? 0 : r.end)));
+      el.innerHTML = `<div class="drvsel-chips">${rs.length === routeIds.length ? '<span class="drv-chip" style="border-color:var(--blue);padding-right:9px">All drivers</span>' : rs.map((r) => `<span class="drv-chip" style="border-color:${colorOf[r.id]}"><i style="background:${colorOf[r.id]}"></i>${esc(r.id)} · ${esc(r.driverName.split(' ')[0])}<button data-unpick="${r.id}" aria-label="Remove ${esc(r.driverName)}" title="Remove">×</button></span>`).join('')}</div>
+        <div class="drvsel-stats small"><b>${rs.length} driver${rs.length > 1 ? 's' : ''}</b> · ${fmt(sum((r) => r.nStops))} stops · ${fmt(sum((r) => r.km))} km · ${fmt(sum((r) => r.onDutyMin) / 60, 1)} h on duty${live ? ` · ${live} stop${live > 1 ? 's' : ''} added live` : ''} · ${hhmm(start)}–${hhmm(end)}</div>
+        <div class="row"><button class="btn sm" id="selPlay">${ICON.play} ${esc(S.playLabel)}</button><button class="btn ghost sm" id="selClear">Show all drivers</button></div>`;
+      $$('[data-unpick]', el).forEach((x) => x.addEventListener('click', () => { S.drvSel.delete(x.dataset.unpick); onSelChange(); }));
+      $('#selPlay', el).addEventListener('click', () => { if (!S.playing) startReplay(); $('#map').scrollIntoView({ behavior: 'smooth', block: 'center' }); });
+      $('#selClear', el).addEventListener('click', () => { S.drvSel.clear(); onSelChange(); });
+    }
+    function startReplay() {
+      stopReplay();
+      const rs = S.drvSel.size ? shown.routes.filter((r) => S.drvSel.has(r.id)) : null;
+      // a selection replays from its first start to its last finish, a little slower so each truck can be followed
+      const from = rs ? Math.max(180, Math.floor((Math.min(...rs.map((r) => (r.start == null ? 360 : r.start))) - 10) / 5) * 5) : 360;
+      const until = rs ? Math.min(1430, Math.max(...rs.map((r) => (r.end == null ? 1320 : r.end))) + 15) : 1320;
+      const step = rs ? 4 : 6;
+      if (S.replayT == null || S.replayT >= until - step || S.replayT < from) S.replayT = from;
+      slider.min = Math.min(330, from);
       $('#playBtn').innerHTML = `${ICON.pause} Pause`;
       S.playing = setInterval(() => {
-        S.replayT += 6;
-        if (S.replayT >= 1320) { stopReplay(); S.replayT = null; }
+        S.replayT += step;
+        if (S.replayT >= until) { stopReplay(); S.replayT = null; }
         slider.value = S.replayT == null ? 1320 : S.replayT;
         $('#clock').textContent = S.replayT == null ? 'All day' : hhmm(S.replayT);
         redraw(false); renderTicker(active);
       }, 120);
-    });
+    }
     function selectRoute(id) {
       S.selectedRoute = S.selectedRoute === id ? null : id;
       $$('tr[data-route]').forEach((tr) => tr.classList.toggle('sel', tr.dataset.route === S.selectedRoute));
@@ -675,6 +826,7 @@
           <label class="toggle"><input type="checkbox" name="allowPartner" checked />Use partner carriers when cheaper</label>
           <label class="toggle"><input type="checkbox" name="allowReloads" checked />Allow mid-day terminal reloads</label>
           <label class="toggle"><input type="checkbox" name="liveReplay" checked />Insert call-ins at their real dispatch time</label>
+          <label class="toggle"><input type="checkbox" name="events" ${S.events ? 'checked' : ''} />Include simulated road &amp; weather events</label>
         </div></div>
       </div>
       <div class="modal-foot"><span class="muted small" id="bStatus" style="margin-right:auto;align-self:center"></span><button type="button" class="btn ghost" data-close>Cancel</button><button type="submit" class="btn">${ICON.arrow} Build plan</button></div>
@@ -694,7 +846,7 @@
       if (f.base.value === 'optimise' && !drivers.length) { $('#bStatus').textContent = 'Pick at least one driver.'; return; }
       const body = {
         name: f.name.value.trim() || 'Custom plan', base: f.base.value,
-        settings: { objective: f.objective.value, maxDutyHours: Number(f.maxDutyHours.value), departTime: Number(f.departTime.value), serviceMin: Number(f.serviceMin.value), allowPartner: f.allowPartner.checked, allowReloads: f.allowReloads.checked, liveReplay: f.liveReplay.checked, drivers: drivers.length === fl.drivers.length ? null : drivers },
+        settings: { objective: f.objective.value, maxDutyHours: Number(f.maxDutyHours.value), departTime: Number(f.departTime.value), serviceMin: Number(f.serviceMin.value), allowPartner: f.allowPartner.checked, allowReloads: f.allowReloads.checked, liveReplay: f.liveReplay.checked, events: f.events.checked ? 'on' : 'off', drivers: drivers.length === fl.drivers.length ? null : drivers },
       };
       $('#bStatus').innerHTML = '<span class="spinner" style="vertical-align:middle"></span> Planning ' + (body.settings.liveReplay && body.base === 'optimise' ? 'and replaying call-ins…' : '…');
       $$('button', f).forEach((b) => (b.disabled = true));
@@ -713,13 +865,14 @@
   function stopReplay() {
     if (S.playing) { clearInterval(S.playing); S.playing = null; }
     const b = $('#playBtn');
-    if (b) b.innerHTML = `${ICON.play} Replay day`;
+    if (b) b.innerHTML = `${ICON.play} ${S.playLabel || 'Replay day'}`;
   }
   function renderTicker(plan) {
     const el = $('#ticker');
     if (!el) return;
     if (S.replayT == null) { el.innerHTML = ''; return; }
-    const evs = (plan.decisions || []).filter((d) => d.type === 'live_insert' && d.time <= S.replayT).slice(-3).reverse();
+    const sel = S.drvSel && S.drvSel.size ? S.drvSel : null;
+    const evs = (plan.decisions || []).filter((d) => d.type === 'live_insert' && d.time <= S.replayT && (!sel || sel.has(d.route))).slice(-3).reverse();
     el.innerHTML = evs.map((d) => `<div class="ev"><b>${hhmm(d.time)}</b> · ${esc(d.decision)}: <span class="muted">${esc(d.subject)}</span></div>`).join('') || '<div class="muted small">06:30 plan locked. Waiting for call-ins…</div>';
   }
   function renderDecisions(plan, f) {
@@ -746,6 +899,7 @@
       <div class="detail-head"><span class="dot" style="background:${color};width:14px;height:14px"></span><h3>${r.id} · ${esc(r.driverName)}</h3>
         <span class="chip grey">${esc(r.vehicle)}</span><span class="chip">${esc(r.vehicleLabel)}</span><span class="chip grey">Licence ${esc(r.licence)} (inferred)</span>${r.vehicleUnknown ? '<span class="chip est">Unit unknown</span>' : ''}
         <span class="muted small" style="margin-left:auto">${hhmm(r.start)} – ${hhmm(r.end)} · ${fmt(r.km)} km · ${fmt(r.driveMin / 60, 1)} h driving · ${fmt(r.onDutyMin / 60, 1)} h on duty</span></div>
+      <div class="row" style="margin-top:10px"><button class="btn ghost sm" data-only="${r.id}">${ICON.play} Show only this driver on the map</button></div>
       ${S._isCustom ? '' : `<p class="small muted" style="margin-top:8px">Want to change this route? <a href="#" data-copy-edit>Copy this plan and edit it</a>; every stop gets a “Move to…” control.</p>`}
       <div class="grid g3" style="margin-top:14px">
         ${bar(r.utilHours, `Hours (${(plan.settings && plan.settings.maxDutyHours) || 14} h limit)`)}${bar(r.utilLb, `Peak weight ${fmt(r.peakLb)} / ${fmt(r.capacity.lb)} lb`)}${bar(r.utilSpots, `Peak floor ${fmt(r.peakSpots, 1)} / ${r.capacity.spots} spots`)}
@@ -755,7 +909,7 @@
           if (s.depot) return `<li><span class="t">${hhmm(s.arr)}</span><span class="k T">T</span><div><div class="who">Scarborough terminal</div><div class="meta">Reload ${hhmm(s.arr)}–${hhmm(s.dep)}</div></div><div></div></li>`;
           const t = T[s.id];
           if (!t) return '';
-          return `<li><span class="t">${hhmm(s.arr)}</span><span class="k ${kindLetter(t.kind)}">${kindLetter(t.kind)}</span><div><div class="who">${esc(t.city || '')} <span class="muted" style="font-weight:400">· ${esc(t.customer || '')}</span></div><div class="meta">${esc(t.orders.join(', '))} · ${fmt(t.weight)} lb · ${fmt(t.spots, t.spots % 1 ? 1 : 0)} spot${t.spots === 1 ? '' : 's'} · window ${hhmm(t.earliest)}–${hhmm(t.hardLatest != null ? t.hardLatest : t.latest)}${s.wait ? ` · waits ${s.wait} min` : ''}</div></div><div class="flags">${flagsFor(t, s)}${S._isCustom ? moveSelect(s.id, r.id, plan) : ''}</div></li>`;
+          return `<li><span class="t">${hhmm(s.arr)}</span><span class="k ${kindLetter(t.kind)}">${kindLetter(t.kind)}</span><div><div class="who">${esc(t.city || '')} <span class="muted" style="font-weight:400">· ${esc(t.customer || '')}</span></div><div class="meta">${esc(t.orders.join(', '))} · ${fmt(t.weight)} lb · ${fmt(t.spots, t.spots % 1 ? 1 : 0)} spot${t.spots === 1 ? '' : 's'} · window ${hhmm(t.earliest)}–${hhmm(t.hardLatest != null ? t.hardLatest : t.latest)}${s.wait ? ` · waits ${s.wait} min` : ''}</div>${s.why ? whyBlock(s.why) : ''}</div><div class="flags">${evChips(s.ev, plan.events)}${flagsFor(t, s)}${S._isCustom ? moveSelect(s.id, r.id, plan) : ''}</div></li>`;
         }).join('')}</ul></div>
         <div>
           ${lp ? `<h3>Load plan (LIFO)</h3><div class="deck-wrap"><div class="deck" style="margin:20px 0">${Array.from({ length: lp.cells }, (_, c) => { const it = cellOwner[c]; return it ? `<div class="cell ${it.dg ? 'dg' : ''} ${it.estimated ? 'est' : ''}" style="background:${shade(it.loadOrder - 1)}" title="${esc(it.id)} · ${fmt(it.weight)} lb">${it.deliveryOrder}</div>` : '<div class="cell free">·</div>'; }).join('')}</div>
@@ -766,6 +920,8 @@
           ${decisions.length ? `<div class="divider"></div><h3>Why this route looks like this</h3><ul class="decisions" style="max-height:260px">${decisions.map((d) => `<li><span class="time">${hhmm(d.time)}</span><div><div class="what">${esc(d.decision)}</div><div class="why"><b>${esc(d.subject)}</b> — ${esc(d.reason)}</div></div></li>`).join('')}</ul>` : ''}
         </div>
       </div></div>`;
+    const ob = $('[data-only]', el);
+    if (ob) ob.addEventListener('click', () => { S.drvSel = new Set([r.id]); if (S._onSelChange) S._onSelChange(); $('#drvSel').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
     const ce = $('[data-copy-edit]', el);
     if (ce) ce.addEventListener('click', (e) => { e.preventDefault(); copyPlan(S.planView); });
   }
@@ -799,7 +955,7 @@
       </div>
       <div class="card">
         <div class="filters">${cats.map((c) => `<button data-cat="${esc(c)}" class="${S.problemsFilter === c ? 'on' : ''}">${esc(c)} ${c === 'All' ? list.length : list.filter((x) => x.category === c).length}</button>`).join('')}</div>
-        ${shownList.map((x) => `<div class="issue ${x.severity}"><div class="ic">${x.severity === 'info' ? ICON.info : ICON.alert}</div><div><div class="title">${esc(x.title)} <span class="chip ${x.severity === 'critical' ? 'crit' : x.severity === 'warning' ? 'warn' : ''}">${esc(x.category)}</span>${x.refs && x.refs.route ? ` <a href="#/plan" data-goto-route="${esc(x.refs.route)}" class="small">${esc(x.refs.route)} →</a>` : ''}</div><div class="det">${esc(x.detail)}</div><div class="fix"><b>Suggested fix:</b> ${esc(x.fix)}</div></div></div>`).join('') || '<div class="empty">No findings in this category.</div>'}
+        ${shownList.map((x) => `<div class="issue ${x.severity}"><div class="ic">${x.severity === 'info' ? ICON.info : ICON.alert}</div><div><div class="title">${esc(x.title)} <span class="chip ${x.severity === 'critical' ? 'crit' : x.severity === 'warning' ? 'warn' : ''}">${esc(x.category)}</span>${x.refs && x.refs.route ? ` <a href="#/plan" data-goto-route="${esc(x.refs.route)}" class="small">${esc(x.refs.route)} →</a>` : ''}</div><div class="det">${esc(x.detail)}</div>${x.refs && x.refs.why ? whyBlock(x.refs.why, x.severity === 'critical') : ''}<div class="fix"><b>Suggested fix:</b> ${esc(x.fix)}</div></div></div>`).join('') || '<div class="empty">No findings in this category.</div>'}
       </div>`;
   }
   viewProblems.after = function () {
@@ -845,6 +1001,7 @@
       if (cur.route) body.route = cur.route;
       if (cur.pickup) body.pickup = cur.pickup;
       if (cur.task) body.task = cur.task;
+      ['reason', 'reasons', 'delayMin', 'extraKm', 'title', 'description', 'icon', 'source'].forEach((k) => { if (cur[k] != null) body[k] = cur[k]; });
       const res = await Data.post('disruptions/' + S.date, body);
       res.ms = Math.round(performance.now() - t0);
       S.disruption = res;
@@ -932,76 +1089,203 @@
   }
 
   // ================================================================== API
+  // ------------------------------------------------------------------ driver view (phone) + dispatcher alerts
+  const KIND_ICON = {
+    traffic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="6" rx="2"/><path d="M5 11l2-5h10l2 5M7 17v2M17 17v2"/></svg>',
+    road_closed: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M7 12h10"/></svg>',
+    hazard: ICON.alert,
+    truck: ICON.wrench,
+  };
+  function driverStopRows(stops, tasks, now, before) {
+    const nextIdx = stops.findIndex((s) => !s.depot && s.dep > now);
+    return stops.map((s, i) => {
+      if (s.depot) return `<li class="${s.dep <= now ? 'done' : ''}"><span class="eta">${hhmm(s.arr)}</span><span class="where"><b>Scarborough terminal</b><span>Reload</span></span><span></span></li>`;
+      const t = tasks[s.id] || {};
+      const old = before && before[s.id];
+      const moved = old != null && Math.abs(old - s.arr) >= 1;
+      const cls = s.dep <= now ? 'done' : i === nextIdx ? 'next' : '';
+      return `<li class="${cls}"><span class="eta">${moved ? `<s>${hhmm(old)}</s>` : ''}${hhmm(s.arr)}</span>
+        <span class="where"><b>${esc(t.city || t.address || s.id)}</b><span>${t.kind === 'P' ? 'Pickup' : t.kind === 'M' ? 'Pickup + delivery' : 'Delivery'} · ${esc(t.customer || '')}${t.hardLatest != null ? ' · appointment' : ''}</span></span>
+        <span>${cls === 'done' ? '<span class="chip grey">Done</span>' : cls === 'next' ? '<span class="chip">Next</span>' : s.late > 0 ? `<span class="chip warn">+${s.late} min</span>` : ''}</span></li>`;
+    }).join('');
+  }
+  async function viewDriver(token) {
+    const plan = await getPlan();
+    if (token !== renderToken) return;
+    const routes = plan.routes.filter((r) => r.nStops);
+    if (!S.driverRoute || !routes.some((r) => r.id === S.driverRoute)) S.driverRoute = (routes.find((r) => r.id === 'R09') || routes[0]).id;
+    if (S.driverNow == null) S.driverNow = 600;
+    if (!S.driverKinds) S.driverKinds = new Set(['traffic']);
+    const picked = Object.keys(KIND_ICON).filter((k) => S.driverKinds.has(k));
+    if (!S.driverDelay) S.driverDelay = 45;
+    const r = routes.find((x) => x.id === S.driverRoute);
+    const tasks = Object.fromEntries(plan.tasks.map((t) => [t.id, t]));
+    const sent = S.driverSent && S.driverSent.route === r.id && S.driverSent.date === S.date ? S.driverSent : null;
+    let afterStops = null, before = null, newRoute = null;
+    if (sent) {
+      const opt = sent.result.options.find((o) => o.id === sent.result.recommended);
+      newRoute = opt && opt.plan.routes.find((x) => x.id === r.id);
+      if (newRoute && !newRoute.broken && newRoute.stops.length) { afterStops = newRoute.stops; before = Object.fromEntries(r.stops.filter((s) => !s.depot).map((s) => [s.id, s.arr])); }
+    }
+    const kinds = Object.keys(KIND_ICON);
+    const labels = { traffic: 'Heavy traffic', road_closed: 'Road closed', hazard: 'Hazardous conditions', truck: 'Truck problem' };
+    $('#view').innerHTML = `
+      <div class="page-head"><div><div class="eyebrow">Driver view · ${esc(S.date)}</div><h1>My route today</h1>
+        <p>What the driver sees on their phone. When something goes wrong on the road, one tap tells dispatch, and the copilot re-plans the rest of the day.</p></div></div>
+      <div class="drv">
+        <div class="card" style="margin-bottom:14px"><div class="params">
+          <label class="field">Driver<select id="dRoute">${routes.map((x) => `<option value="${x.id}" ${x.id === r.id ? 'selected' : ''}>${x.id} · ${esc(x.driverName)}</option>`).join('')}</select></label>
+          <label class="field">Time now <span id="dNowLbl" style="text-transform:none;color:var(--ink);font-size:14px">${hhmm(S.driverNow)}</span><input type="range" id="dNow" min="360" max="1080" step="5" value="${S.driverNow}" /></label>
+        </div></div>
+        <div class="card" style="margin-bottom:14px">
+          <div class="who"><h2>${esc(r.driverName)}</h2><span class="muted small">${esc(r.vehicle)} · ${esc(r.vehicleLabel)} · ends ${hhmm((afterStops ? newRoute : r).end)}</span></div>
+          ${sent ? `<p class="small" style="margin:8px 0 0"><b>Updated by dispatch at ${esc(sent.timeLabel)}.</b> ${newRoute && newRoute.broken ? 'This truck is out of service. Help is on the way: stay with the truck.' : 'Struck-through times are the old ETAs.'}</p>` : ''}
+          <ul class="drv-stops" style="margin-top:8px">${driverStopRows(afterStops || r.stops, tasks, S.driverNow, before)}</ul>
+        </div>
+        ${sent ? `<div class="card sent" style="margin-bottom:14px"><h3 style="margin-top:0">Dispatch has your report</h3>
+            <p class="small" style="margin:0 0 6px">${esc(sent.description)}</p>
+            <p class="small" style="margin:0"><b>Dispatch plan:</b> ${esc(sent.recommendation)}</p>
+            <div class="row" style="margin-top:10px"><button class="btn ghost sm" id="dNew">Report something else</button></div></div>`
+        : `<div class="card"><h3 style="margin-top:0">Report a problem</h3>
+            <p class="small muted" style="margin:-4px 0 10px">Tap everything that applies.</p>
+            <div class="report-kinds" role="group" aria-label="Problem types, pick one or more">${kinds.map((k) => `<button data-kind="${k}" class="${S.driverKinds.has(k) ? 'on' : ''}" aria-pressed="${S.driverKinds.has(k)}">${S.driverKinds.has(k) ? '<span class="tick" aria-hidden="true">✓</span>' : ''}${KIND_ICON[k]}${labels[k]}</button>`).join('')}</div>
+            ${!picked.length ? '<p class="small muted" style="margin:14px 0 0">Pick at least one problem.</p>'
+              : picked.includes('truck') ? `<p class="small muted" style="margin:14px 0 0">The truck cannot continue${picked.length > 1 ? ', so the road conditions are passed on with it' : ''}: dispatch will send help and move your remaining stops.</p>`
+              : `<p class="field" style="margin:14px 0 6px">How far behind are you${picked.length > 1 ? ' in total' : ''}?</p><div class="delay-pick" role="group" aria-label="Delay">${[15, 30, 45, 60, 90].map((m) => `<button data-delay="${m}" class="${S.driverDelay === m ? 'on' : ''}" aria-pressed="${S.driverDelay === m}">${m} min</button>`).join('')}</div>`}
+            <div style="margin-top:16px"><button class="btn big" id="dSend" ${picked.length ? '' : 'disabled'}>Send to dispatch${picked.length > 1 ? ` (${picked.length} problems)` : ''}</button></div>
+            <p class="small muted" id="dMsg" style="margin:8px 0 0"></p></div>`}
+      </div>`;
+    $('#dRoute').addEventListener('change', (e) => { S.driverRoute = e.target.value; route(); });
+    $('#dNow').addEventListener('input', (e) => { S.driverNow = Number(e.target.value); $('#dNowLbl').textContent = hhmm(S.driverNow); });
+    $('#dNow').addEventListener('change', () => route());
+    $$('[data-kind]').forEach((b) => b.addEventListener('click', () => { const k = b.dataset.kind; if (S.driverKinds.has(k)) S.driverKinds.delete(k); else S.driverKinds.add(k); route(); }));
+    $$('[data-delay]').forEach((b) => b.addEventListener('click', () => { S.driverDelay = Number(b.dataset.delay); route(); }));
+    const nb = $('#dNew'); if (nb) nb.addEventListener('click', () => { S.driverSent = null; route(); });
+    const sb = $('#dSend');
+    if (sb) sb.addEventListener('click', async () => {
+      sb.disabled = true; $('#dMsg').textContent = 'Sending…';
+      try {
+        const res = await Data.post('reports/' + S.date, { route: r.id, kinds: picked, kind: picked[0], delayMin: S.driverDelay, time: S.driverNow });
+        S.driverSent = res;
+        Alerts.poll();
+        route();
+      } catch (err) { $('#dMsg').textContent = 'Could not send: ' + err.message; sb.disabled = false; }
+    });
+  }
+  // dispatcher side: new driver reports pop up on every page except the driver view
+  const Alerts = {
+    seen: new Set(), list: [], timer: null,
+    async poll() {
+      if (!S.date) return;
+      try {
+        const res = await Data.get('reports/' + S.date);
+        this.list = res.reports || [];
+      } catch (e) { return; }
+      this.render();
+    },
+    render() {
+      let box = $('#alerts');
+      if (!box) { box = document.createElement('div'); box.id = 'alerts'; box.className = 'alerts'; box.setAttribute('aria-live', 'polite'); document.body.appendChild(box); }
+      const onDriver = (location.hash.replace(/^#\/?/, '').split('?')[0]) === 'driver';
+      const show = onDriver ? [] : this.list.filter((r) => !this.seen.has(r.id)).slice(0, 3);
+      box.innerHTML = show.map((r) => `<div class="alert-card" role="alert"><div class="t">${KIND_ICON[r.kind] || ICON.alert}${esc(r.label)} on ${esc(r.route)} · ${esc(r.timeLabel)}</div>
+        <p>${esc(r.description)}</p><p class="rec">Recommended: <b>${esc(r.recommendation)}</b></p>
+        <div class="row"><button class="btn sm" data-review="${r.id}">Review options</button><button class="btn ghost sm" data-dismiss="${r.id}">Dismiss</button></div></div>`).join('');
+      $$('[data-review]', box).forEach((b) => b.addEventListener('click', () => this.review(b.dataset.review)));
+      $$('[data-dismiss]', box).forEach((b) => b.addEventListener('click', async () => { this.seen.add(b.dataset.dismiss); this.render(); try { await Data.del(`reports/${S.date}/${b.dataset.dismiss}`); } catch (e) { /* already gone */ } }));
+    },
+    async review(id) {
+      this.seen.add(id); this.render();
+      const rep = await Data.get(`reports/${S.date}/${id}`);
+      const ev = rep.result.event;
+      S.scenario = Object.assign({ date: S.date }, ev);
+      S.disruption = Object.assign({}, rep.result, { ms: 0 });
+      S.selectedOption = rep.result.recommended;
+      if (location.hash === '#/adapt') route(); else location.hash = '#/adapt';
+    },
+    start() { this.poll(); if (!this.timer) this.timer = setInterval(() => this.poll(), 8000); window.addEventListener('hashchange', () => this.render()); },
+  };
+
   async function viewApi() {
     const base = location.origin + location.pathname.replace(/index\.html$/, '');
-    const eps = [
-      ['GET', 'health', 'Service health, dataset and available dates (no key)'],
-      ['GET', 'summary', 'Copilot vs as-dispatched across all days'],
-      ['GET', `plan/${S.date}`, 'Full recommended plan: routes, ETAs, load plans, partner tenders, KPIs, decisions'],
-      ['GET', `plan/${S.date}/compare`, 'KPI comparison copilot / manual / GPS actuals'],
-      ['GET', `plan/${S.date}/routes/R01`, 'One route manifest (driver view) with its decisions'],
-      ['GET', `conflicts/${S.date}?plan=manual`, 'Problems found in the as-dispatched plan'],
-      ['GET', `decisions/${S.date}`, 'Explained decision log (add ?format=csv to download)'],
-      ['GET', `export/${S.date}?format=csv`, 'Download the dispatch file (CSV or ?format=json)'],
-      ['GET', `plans/${S.date}`, 'Every plan for the day (copilot, as dispatched, custom) with KPIs and fleet mix'],
-      ['POST', `plans/${S.date}`, 'Build a custom plan: objective, fleet, shift rules, or a copy to edit'],
-      ['GET', `fleet/${S.date}`, 'Drivers and vehicles available, objectives, default settings'],
-      ['GET', `scenarios/${S.date}`, 'Ready-made disruption scenarios'],
-      ['POST', `disruptions/${S.date}`, 'Evaluate a disruption → ranked recovery options'],
-      ['GET', 'assumptions', 'Every modelling assumption (no key)'],
-      ['GET', 'openapi.json', 'OpenAPI 3 spec (no key)'],
+    // the calls people actually try, in plain words; the rest sit under "Show all endpoints"
+    const main = [
+      ['GET', `plan/${S.date}`, 'Today\'s plan', 'Every route, stop, ETA and load plan the copilot recommends'],
+      ['GET', `plan/${S.date}/compare`, 'Copilot vs as dispatched', 'The headline numbers for the day, side by side'],
+      ['GET', `conflicts/${S.date}?plan=manual`, 'Problems in George\'s plan', 'Overloads, missed appointments, hours-of-service breaches'],
+      ['GET', `decisions/${S.date}`, 'Decision log', 'Every decision the copilot made, with its reason'],
+      ['POST', `disruptions/${S.date}`, 'A truck breaks down', 'Ranked recovery options, each with cost and late stops'],
+      ['GET', `plans/${S.date}`, 'All plans for the day', 'Copilot, as dispatched and any custom plans, with their numbers'],
     ];
+    const more = [
+      ['GET', 'health', 'Is the service up, and which days are loaded (no key needed)'],
+      ['GET', 'summary', 'Copilot vs as dispatched across all 10 days'],
+      ['GET', `plan/${S.date}/routes/R01`, 'One route as a driver would receive it'],
+      ['GET', `export/${S.date}?format=csv`, 'The dispatch file (first 25 lines)'],
+      ['POST', `plans/${S.date}`, 'Build a custom plan ("Use the whole fleet")'],
+      ['GET', `fleet/${S.date}`, 'Drivers, vehicles and plan settings available'],
+      ['GET', `scenarios/${S.date}`, 'The ready-made disruption scenarios'],
+      ['GET', `events/${S.date}`, 'The simulated road & weather events for the day'],
+      ['GET', 'assumptions', 'Every modelling assumption (no key needed)'],
+      ['GET', 'openapi.json', 'The technical API description (no key needed)'],
+    ];
+    const row = ([m, p, title, desc]) => `<div class="endpoint"><span class="method ${m === 'POST' ? 'post' : ''}">${m}</span><div><b>${esc(title)}</b><div class="d">${desc ? esc(desc) + ' · ' : ''}<code>/api/v1/${esc(p)}</code></div></div><button class="btn sm ghost" data-try="${m} ${esc(p)}">Try</button></div>`;
+    const faq = (q, a, open) => `<details class="faq"${open ? ' open' : ''}><summary>${q}</summary><div class="faq-body">${a}</div></details>`;
     return `
-      <div class="page-head"><div><div class="eyebrow">Connect</div><h1>API &amp; exports</h1><p>Every recommendation, conflict and decision the copilot makes is available over REST, so Elite TMS, Samsara, a BI tool or a partner portal can pull it. ${Data.mode === 'local' ? '<b>Offline mode:</b> the server is not running, so calls below run in the browser.' : ''}</p></div></div>
+      <div class="page-head"><div><div class="eyebrow">Connect</div><h1>API &amp; exports</h1><p>Download what the copilot worked out, or let another system pull it automatically. ${Data.mode === 'local' ? '<b>Offline mode:</b> the server is not running, so calls below run in the browser.' : ''}</p></div></div>
+      <div class="card" style="margin-bottom:16px">
+        <h3>Download for ${esc(S.date)}</h3>
+        <div class="dl-grid">
+          <a class="dl" href="api/v1/export/${S.date}?format=csv&api_key=${API_KEY}">${ICON.down}<span><b>Dispatch file (CSV)</b><span>One row per stop: route, driver, ETA, load order. Opens in Excel; ready for Samsara or the dock.</span></span></a>
+          <a class="dl" href="api/v1/decisions/${S.date}?format=csv&api_key=${API_KEY}">${ICON.down}<span><b>Decision log (CSV)</b><span>Every decision the copilot made today, with the reason.</span></span></a>
+          <a class="dl" href="api/v1/export/${S.date}?format=json&api_key=${API_KEY}">${ICON.down}<span><b>Dispatch file (JSON)</b><span>The same rows, for another system to read.</span></span></a>
+        </div>
+        <p class="small muted" style="margin-top:10px">These are for the copilot plan. To download George's plan or a custom plan, use the buttons on Plan the Day.</p>
+      </div>
       <div class="grid g2">
         <div class="card">
-          <h3>Authentication</h3>
-          <div class="keybox">Base URL <code>${esc(base)}api/v1/</code></div>
-          <div class="keybox" style="margin-top:8px">Header <code>X-API-Key: ${API_KEY}</code> <span class="muted small">(demo key; also accepted as <code>?api_key=</code>)</span></div>
-          <div class="divider"></div>
-          <h3>Downloads for ${esc(S.date)}</h3>
-          <div class="row">
-            <a class="btn sm" href="api/v1/export/${S.date}?format=csv&api_key=${API_KEY}">${ICON.down} Dispatch file CSV</a>
-            <a class="btn sm ghost" href="api/v1/export/${S.date}?format=json&api_key=${API_KEY}">${ICON.down} Dispatch JSON</a>
-            <a class="btn sm ghost" href="api/v1/decisions/${S.date}?format=csv&api_key=${API_KEY}">${ICON.down} Decisions CSV</a>
-            <a class="btn sm ghost" href="api/v1/openapi.json" target="_blank">OpenAPI spec</a>
-          </div>
-          <div class="divider"></div>
-          <h3>Endpoints</h3>
-          ${eps.map(([m, p, desc]) => `<div class="endpoint"><span class="method ${m === 'POST' ? 'post' : ''}">${m}</span><div><code>/api/v1/${esc(p)}</code><div class="d">${esc(desc)}</div></div><button class="btn sm ghost" data-try="${m} ${esc(p)}">Try</button></div>`).join('')}
+          <h3>Try it live</h3>
+          <p class="small muted" style="margin:0 0 4px">Each button calls the real API and shows the answer on the right.</p>
+          ${main.map(row).join('')}
+          <details class="more-eps"><summary>Show all endpoints (${more.length} more)</summary>${more.map(([m, p, d]) => row([m, p, d, ''])).join('')}</details>
         </div>
-        <div>
-          <div class="card"><h3>Response</h3><div class="muted small" id="tryLabel" style="margin-bottom:8px">Press “Try” on any endpoint.</div><pre class="code" id="tryOut">{ }</pre></div>
-          <div class="card" style="margin-top:16px"><h3>Use it from anywhere</h3>
-<pre class="code"><span class="k"># Today's recommended plan</span>
+        <div class="card"><h3>Response</h3><div class="muted small" id="tryLabel" style="margin-bottom:8px">Press “Try” on any call.</div><pre class="code" id="tryOut">{ }</pre></div>
+      </div>
+      <div class="section" style="margin-top:24px">
+        <h2 style="font-size:18px;margin-bottom:10px">Questions about the API</h2>
+        ${faq('How do I connect another system?', `<p>Use this address and send the key with every call:</p>
+          <div class="keybox">Address <code>${esc(base)}api/v1/</code></div>
+          <div class="keybox" style="margin-top:8px">Key <code>X-API-Key: ${API_KEY}</code> <span class="muted small">(a demo key; it also works as <code>?api_key=</code> in a link)</span></div>`)}
+        ${faq('How do I call it from a terminal?', `<pre class="code"><span class="k"># Today's recommended plan</span>
 curl -H "X-API-Key: ${API_KEY}" \\
   ${esc(base)}api/v1/plan/${S.date}
 
-<span class="k"># A truck broke down at 11:44: what now?</span>
+<span class="k"># A truck broke down at 09:18: what now?</span>
 curl -X POST -H "X-API-Key: ${API_KEY}" \\
   -H "Content-Type: application/json" \\
-  -d '{"type":"breakdown","route":"R01","time":704}' \\
+  -d '{"type":"breakdown","time":558}' \\
   ${esc(base)}api/v1/disruptions/${S.date}
 
 <span class="k"># Build a custom plan that uses the whole fleet</span>
 curl -X POST -H "X-API-Key: ${API_KEY}" \\
   -H "Content-Type: application/json" \\
   -d '{"name":"Whole fleet","settings":{"objective":"balanced","maxDutyHours":12}}' \\
-  ${esc(base)}api/v1/plans/${S.date}
-
-<span class="k"># Python: pull decisions into a BI tool</span>
-import requests
+  ${esc(base)}api/v1/plans/${S.date}</pre>`)}
+        ${faq('How do I use it from Python or a BI tool?', `<pre class="code">import requests
 r = requests.get("${esc(base)}api/v1/decisions/${S.date}",
                  headers={"X-API-Key": "${API_KEY}"})
 for d in r.json()["decisions"]:
-    print(d["timeLabel"], d["decision"], d["reason"])</pre></div>
-          <div class="card" style="margin-top:16px"><h3>Integration pattern</h3><ol class="small" style="padding-left:18px;margin:0">
-            <li><b>05:30</b>: pull orders from Elite (ORDERTRAIL), drivers and HOS from Samsara</li>
-            <li><b>06:00</b>: <code>GET /plan/{date}</code> → George reviews and approves in the console</li>
-            <li><b>06:30</b>: push approved routes to Samsara (same <code>driver_YYMMDD</code> naming) and print dock load sheets from <code>/export</code></li>
-            <li><b>All day</b>: each new Elite dispatch → live insertion. Disruptions → <code>POST /disruptions</code> → George picks an option</li>
-            <li><b>Evening</b>: <code>/decisions</code> and <code>/compare</code> feed the KPI review</li></ol></div>
-        </div>
+    print(d["timeLabel"], d["decision"], d["reason"])</pre>
+          <p class="small muted" style="margin-top:8px">Power BI and Excel can read the CSV download links directly.</p>`)}
+        ${faq('How would it fit with Elite TMS and Samsara?', `<ol class="small" style="padding-left:18px;margin:0;line-height:1.7">
+            <li><b>05:30</b>: pull orders from ${ELITE}, and drivers and hours from ${SAMSARA}</li>
+            <li><b>06:00</b>: the copilot plans the day; George reviews and approves it here</li>
+            <li><b>06:30</b>: approved routes go to the drivers' Samsara app; the dock prints load sheets from the dispatch file</li>
+            <li><b>All day</b>: each new Elite order is inserted live; disruptions and driver reports come with recovery options for George</li>
+            <li><b>Evening</b>: the decision log and the day's comparison feed the KPI review</li></ol>`)}
+        ${faq('Can I get George\'s plan or a custom plan instead?', `<p class="small">Yes. Add <code>?plan=manual</code> for George's plan, or <code>?plan=</code> followed by a custom plan's id, to the dispatch file, decision log and problems calls. The <b>Dispatch file</b> and <b>Save log</b> buttons on Plan the Day do this for whichever plan is open.</p>`)}
+        ${faq('Where is the full technical reference?', `<p class="small">The <a href="api/v1/openapi.json" target="_blank">OpenAPI description</a> lists every endpoint, including the driver-report calls used by the Driver view (<code>/api/v1/reports/{date}</code>).</p>`)}
+        ${faq('Is this secure enough for production?', `<p class="small">Not yet: the demo uses one shared key. In production each system and user gets its own key or single sign-on, all traffic runs over HTTPS, and every call is logged.</p>`)}
       </div>`;
   }
   viewApi.after = function () {
@@ -1031,7 +1315,10 @@ for d in r.json()["decisions"]:
 
   // ================================================================== ASSUMPTIONS
   async function viewAssumptions() {
-    const [a, plan] = await Promise.all([getAssumptions(), getPlan()]);
+    const [a, plan, cmp] = await Promise.all([getAssumptions(), getPlan(), getCompare()]);
+    const logKm = cmp.actual && cmp.actual.logbookKm;
+    const learned = plan.tasks.filter((t) => t.svcSource === 'history');
+    const svcMed = (() => { const v = learned.map((t) => t.serviceMin).sort((x, y) => x - y); return v.length ? v[Math.floor(v.length / 2)] : 0; })();
     const est = (k) => plan.tasks.filter((t) => t.estimated.includes(k)).length;
     return `
       <div class="page-head"><div><div class="eyebrow">Data transparency</div><h1>What is real, what is estimated, and why</h1><p>The copilot never hides a guess. Each estimated value is tagged <span class="chip est">EST</span> in the plan, and every modelling assumption is listed here and served by <code>/api/v1/assumptions</code>.</p></div></div>
@@ -1044,6 +1331,15 @@ for d in r.json()["decisions"]:
       <div class="grid g2">
         <div class="card"><h3>Modelling assumptions</h3><table class="tbl"><tbody>${Object.entries(a.assumptions).map(([k, v]) => `<tr><td style="width:150px"><b>${esc(k)}</b></td><td><div><b>${esc(v.value)}</b></div><div class="small muted">${esc(v.text)}</div></td></tr>`).join('')}</tbody></table></div>
         <div>
+          <div class="card" style="margin-bottom:16px"><h3>Stop times learned from history, ${esc(S.date)}</h3>
+            <p class="small" style="margin:0 0 6px"><b>${learned.length} of ${plan.tasks.length}</b> stops use the median time this customer actually took on other days in ${SAMSARA} GPS data (median ${fmt(svcMed)} min). The other ${plan.tasks.length - learned.length} customers had no visit on another day, so they use the 15 min + extras rule.</p>
+            <p class="small muted" style="margin:0">Both plans use the same stop times, so the comparison stays fair, and routes are sized for how long stops really take.</p></div>
+          ${logKm ? `<div class="card" style="margin-bottom:16px"><h3>Distance reality check, ${esc(S.date)}</h3><table class="tbl"><tbody>
+            <tr><td>Trucks' own logbooks (${SAMSARA} ELD, every km driven)</td><td class="num"><b>${fmt(logKm)} km</b></td></tr>
+            <tr><td>Our model of George's plan</td><td class="num">${fmt(cmp.manual.km)} km</td></tr>
+            <tr><td>Copilot plan, same model</td><td class="num">${fmt(cmp.copilot.km)} km</td></tr>
+            <tr><td>GPS inside Samsara routes only</td><td class="num muted">${fmt(cmp.actual.gpsKm)} km</td></tr></tbody></table>
+            <p class="small muted" style="margin:8px 0 0">The model estimates George's plan ${fmt(Math.abs(Math.round(((cmp.manual.km - logKm) / logKm) * 100)))}% ${cmp.manual.km <= logKm ? 'below' : 'above'} what the logbooks recorded, so the savings shown are conservative. Route GPS is lower because it only counts driving inside Samsara routes, not every trip a truck made that day.</p></div>` : ''}
           <div class="card"><h3>Vehicle classes</h3><table class="tbl"><thead><tr><th>Class</th><th>Payload</th><th>Floor</th><th>Licence</th><th>$/km</th></tr></thead><tbody>${Object.values(a.vehicles).map((v) => `<tr><td><b>${esc(v.label)}</b></td><td class="num">${fmt(v.maxLb)} lb</td><td class="num">${v.spots} spots</td><td>${esc(v.licence.join('/'))}</td><td class="num">$${v.costKm}</td></tr>`).join('')}</tbody></table></div>
           <div class="card" style="margin-top:16px"><h3>Straight from the data</h3><ul class="small" style="padding-left:18px;margin:0;line-height:1.7">
             <li>Orders, legs, addresses, coordinates, weights, pieces, services, equipment and handling flags: Elite TMS (ORDERTRAIL)</li>
@@ -1064,13 +1360,19 @@ for d in r.json()["decisions"]:
   // ------------------------------------------------------------------ boot
   async function boot() {
     const h = await Data.init();
-    const st = $('#apiStatus');
-    st.classList.toggle('local', Data.mode === 'local');
-    st.querySelector('span').textContent = Data.mode === 'api' ? 'API connected' : 'Offline: in-browser engine';
+    Health.paint();
+    Health.start();
+    setTimeout(() => Alerts.start(), 0);
     S.dates = h.dates;
     S.date = h.defaultDate;
     const sel = $('#dateSelect');
     sel.innerHTML = h.dates.map((d) => `<option value="${d}" ${d === S.date ? 'selected' : ''}>${new Date(d + 'T12:00').toLocaleDateString('en-CA', { weekday: 'short', month: 'short', day: 'numeric' })}</option>`).join('');
+    const evBtn = $('#evToggle');
+    const paintEv = () => { evBtn.classList.toggle('on', S.events); evBtn.setAttribute('aria-pressed', S.events); evBtn.querySelector('span').textContent = `Road & weather: ${S.events ? 'On' : 'Off'}`; };
+    window.toggleEvents = () => { S.events = !S.events; paintEv(); stopReplay(); S.selectedRoute = null; S.disruption = null; S.scenario = null; S.replayT = null; S.applied = {}; route(); toast(S.events ? '<b>Simulated road &amp; weather events on.</b> Plans now include closures, construction, weather, event traffic and accidents.' : 'Simulated events off.', 'good'); };
+    evBtn.addEventListener('click', () => window.toggleEvents());
+    document.addEventListener('click', (e) => { if (e.target.closest('[data-ev-toggle]')) window.toggleEvents(); });
+    paintEv();
     sel.addEventListener('change', () => { S.date = sel.value; S.selectedRoute = null; S.disruption = null; S.scenario = null; S.replayT = null; route(); });
     window.addEventListener('hashchange', route);
     document.addEventListener('change', onMoveSelect);

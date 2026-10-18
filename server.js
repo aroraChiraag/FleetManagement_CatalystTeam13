@@ -24,9 +24,12 @@ function memo(key, fn) {
   return cache.get(key);
 }
 const dayOf = (date) => DATA.days[date];
-const planOf = (date) => memo('plan:' + date, () => E.planDay(dayOf(date), { dynamic: true }));
-const manualOf = (date) => memo('manual:' + date, () => E.manualPlan(dayOf(date)));
-const scenariosOf = (date) => memo('scen:' + date, () => E.scenarioCatalog(planOf(date), dayOf(date)));
+// simulated road & weather events are switched on per request with ?events=1; the 10-day summary always runs without them
+let EV = false;
+const evKey = (ev) => (ev ? ':ev' : '');
+const planOf = (date, ev = EV) => memo('plan:' + date + evKey(ev), () => E.planDay(dayOf(date), { dynamic: true, settings: ev ? { events: 'on' } : undefined }));
+const manualOf = (date, ev = EV) => memo('manual:' + date + evKey(ev), () => E.manualPlan(dayOf(date), { events: ev ? 'on' : 'off' }));
+const scenariosOf = (date, ev = EV) => memo('scen:' + date + evKey(ev), () => E.scenarioCatalog(planOf(date, ev), dayOf(date)));
 
 // ------------------------------------------------------------------ custom plans (saved as recipes, rebuilt on demand)
 const CUSTOM_FILE = path.join(ROOT, 'data', 'custom-plans.json');
@@ -45,9 +48,9 @@ function customOf(date, id) {
   if (!customPlans.has(id)) customPlans.set(id, E.buildCustomPlan(dayOf(date), r));
   return customPlans.get(id);
 }
-function anyPlan(date, id) {
-  if (!id || id === 'copilot') return planOf(date);
-  if (id === 'manual') return manualOf(date);
+function anyPlan(date, id, ev = EV) {
+  if (!id || id === 'copilot') return planOf(date, ev);
+  if (id === 'manual') return manualOf(date, ev);
   return customOf(date, id);
 }
 function planMeta(date, id) {
@@ -63,19 +66,20 @@ function publicCustom(date, id) {
   out.planId = id;
   return out;
 }
-const conflictsOf = (date, which) => {
-  if (which === 'copilot' || which === 'manual') return memo(`conf:${which}:${date}`, () => E.detectConflicts(which === 'manual' ? manualOf(date) : planOf(date), dayOf(date), which));
+const conflictsOf = (date, which, ev = EV) => {
+  if (which === 'copilot' || which === 'manual') return memo(`conf:${which}:${date}${evKey(ev)}`, () => E.detectConflicts(which === 'manual' ? manualOf(date, ev) : planOf(date, ev), dayOf(date), which));
   return E.detectConflicts(anyPlan(date, which), dayOf(date), recipeOf(date, which).base === 'manual' ? 'manual' : 'custom');
 };
 
-function compareOf(date) {
-  return memo('cmp:' + date, () => {
-    const p = planOf(date), m = manualOf(date);
+function compareOf(date, ev = EV) {
+  return memo('cmp:' + date + evKey(ev), () => {
+    const p = planOf(date, ev), m = manualOf(date, ev);
     return {
       date, weekday: dayOf(date).weekday,
       copilot: p.kpis, manual: m.kpis, actual: dayOf(date).actualSummary, morning: p.morningKpis,
       liveInsertions: p.live.length,
-      conflicts: { copilot: countSev(conflictsOf(date, 'copilot')), manual: countSev(conflictsOf(date, 'manual')) },
+      conflicts: { copilot: countSev(conflictsOf(date, 'copilot', ev)), manual: countSev(conflictsOf(date, 'manual', ev)) },
+      events: ev ? p.events : [],
     };
   });
 }
@@ -84,7 +88,7 @@ function countSev(list) {
 }
 function summaryAll() {
   return memo('summary', () => {
-    const days = DATES.map(compareOf);
+    const days = DATES.map((d) => compareOf(d, false));
     const sum = (f) => days.reduce((a, d) => a + f(d), 0);
     const pct = (a, b) => Math.round(((a - b) / b) * 1000) / 10;
     const c = { km: sum((d) => d.copilot.km), cost: sum((d) => d.copilot.totalCost), trucks: sum((d) => d.copilot.trucksUsed), late: sum((d) => d.copilot.lateStops), stops: sum((d) => d.copilot.stopsRouted), duty: sum((d) => d.copilot.dutyHours), co2: sum((d) => d.copilot.co2kg) };
@@ -92,7 +96,7 @@ function summaryAll() {
     // how each vehicle class was used, summed over all days
     const mix = (which) => {
       const rows = {};
-      for (const d of DATES) for (const f of (which === 'copilot' ? planOf(d) : manualOf(d)).fleet) {
+      for (const d of DATES) for (const f of (which === 'copilot' ? planOf(d, false) : manualOf(d, false)).fleet) {
         const r = (rows[f.cls] = rows[f.cls] || { cls: f.cls, short: f.short, label: f.label, available: 0, used: 0, stops: 0, utilSpotsSum: 0, utilLbSum: 0, small: 0, tractorOnly: 0, heavy: 0, overloads: 0, mismatches: 0 });
         r.available += f.available; r.used += f.used; r.stops += f.stops; r.utilSpotsSum += f.utilSpots * f.used; r.utilLbSum += f.utilLb * f.used;
         r.small += f.small; r.tractorOnly += f.tractorOnly; r.heavy += f.heavy; r.overloads += f.overloads; r.mismatches += f.mismatches;
@@ -108,6 +112,10 @@ function summaryAll() {
         onTimeCopilot: Math.round(((c.stops - c.late) / c.stops) * 1000) / 10,
         onTimeManual: Math.round(((m.stops - m.late) / m.stops) * 1000) / 10,
         kmSaved: m.km - c.km, costSaved: m.cost - c.cost, co2Saved: m.co2 - c.co2,
+        // reality check: the trucks' own ELD logbook km (includes deadhead and terminal returns)
+        logbookKm: sum((d) => (d.actual && d.actual.logbookKm) || 0),
+        manualVsLogbookPct: pct(m.km, sum((d) => (d.actual && d.actual.logbookKm) || 0)),
+        copilotVsLogbookPct: pct(c.km, sum((d) => (d.actual && d.actual.logbookKm) || 0)),
         trucksFreedPerDay: Math.round(((m.trucks - c.trucks) / days.length) * 10) / 10,
         utilSpotsCopilot: avg((d) => d.copilot.avgUtilSpots), utilSpotsManual: avg((d) => d.manual.avgUtilSpots),
         utilLbCopilot: avg((d) => d.copilot.avgUtilLb), utilLbManual: avg((d) => d.manual.avgUtilLb),
@@ -221,7 +229,8 @@ api('POST', '/api/v1/plans/:date', async (p, q, req) => {
   const d = needDate(p);
   const body = await readBody(req);
   const base = ['optimise', 'copilot', 'manual'].includes(body.base) ? body.base : 'optimise';
-  const r = { id: 'c' + Date.now().toString(36), date: d, name: String(body.name || 'Custom plan').slice(0, 60), base, settings: base === 'optimise' ? body.settings || {} : {}, moves: [], created: new Date().toISOString() };
+  const evSetting = body.settings && body.settings.events === 'on' ? 'on' : 'off';
+  const r = { id: 'c' + Date.now().toString(36), date: d, name: String(body.name || 'Custom plan').slice(0, 60), base, settings: base === 'optimise' ? Object.assign({}, body.settings || {}, { events: evSetting }) : { events: evSetting }, moves: [], created: new Date().toISOString() };
   recipes.push(r);
   try { customOf(d, r.id); } catch (e) { recipes = recipes.filter((x) => x !== r); throw e; }
   saveRecipes();
@@ -256,17 +265,48 @@ api('DELETE', '/api/v1/plans/:date/:id', (p) => {
   saveRecipes();
   return { deleted: p.id };
 });
+api('GET', '/api/v1/events/:date', (p) => {
+  const d = needDate(p);
+  return { date: d, simulated: true, events: E.eventsForDay(d), note: 'Simulated for demonstration; not real traffic or weather data.' };
+});
 api('GET', '/api/v1/scenarios/:date', (p) => ({ date: needDate(p), scenarios: scenariosOf(needDate(p)) }));
 api('POST', '/api/v1/disruptions/:date', async (p, q, req) => {
   const d = needDate(p);
+  let ev = EV;
   const body = await readBody(req);
-  if (!['breakdown', 'driver_absent', 'hot_order', 'failed_delivery'].includes(body.type)) { const e = new Error('type must be one of breakdown | driver_absent | hot_order | failed_delivery'); e.status = 400; throw e; }
-  const preset = scenariosOf(d).find((s) => s.type === body.type) || {};
+  ev = ev || body.events === true;
+  if (!['breakdown', 'driver_absent', 'hot_order', 'failed_delivery', 'delay'].includes(body.type)) { const e = new Error('type must be one of breakdown | driver_absent | hot_order | failed_delivery | delay'); e.status = 400; throw e; }
+  const preset = scenariosOf(d, ev).find((s) => s.type === body.type) || {};
   const event = Object.assign({}, preset, body);
   if (event.time != null) event.time = Number(event.time);
-  const out = E.disrupt(dayOf(d), event, { basePlan: planOf(d) });
+  const out = E.disrupt(dayOf(d), event, { basePlan: planOf(d, ev) });
   if (q.compact === '1') out.options.forEach((o) => delete o.plan);
   return Object.assign({ date: d }, out);
+});
+
+// ---- driver reports: a driver taps "Report a problem"; dispatch sees it with recovery options
+const REPORTS = {};
+let reportSeq = 0;
+const reportSummary = (r) => { const { result, ...rest } = r; return rest; };
+api('POST', '/api/v1/reports/:date', async (p, q, req) => {
+  const d = needDate(p);
+  const ev = EV;
+  const body = await readBody(req);
+  const rep = Object.assign({ id: 'RPT-' + String(++reportSeq).padStart(3, '0'), date: d, createdAt: new Date().toISOString(), events: ev || body.events === true }, E.driverReport(dayOf(d), planOf(d, ev || body.events === true), body));
+  (REPORTS[d] = REPORTS[d] || []).unshift(rep);
+  if (REPORTS[d].length > 50) REPORTS[d].length = 50;
+  return Object.assign(reportSummary(rep), { result: rep.result });
+});
+api('GET', '/api/v1/reports/:date', (p) => ({ date: needDate(p), reports: (REPORTS[needDate(p)] || []).map(reportSummary) }));
+api('GET', '/api/v1/reports/:date/:id', (p) => {
+  const r = (REPORTS[needDate(p)] || []).find((x) => x.id === p.id);
+  if (!r) { const e = new Error('Unknown report ' + p.id); e.status = 404; throw e; }
+  return r;
+});
+api('DELETE', '/api/v1/reports/:date/:id', (p) => {
+  const d = needDate(p);
+  REPORTS[d] = (REPORTS[d] || []).filter((x) => x.id !== p.id);
+  return { deleted: p.id };
 });
 
 function openapi() {
@@ -296,6 +336,9 @@ function openapi() {
       '/api/v1/decisions/{date}': { get: { summary: 'Explained decision log', parameters: [{ name: 'format', in: 'query', schema: { type: 'string', enum: ['json', 'csv'] } }] } },
       '/api/v1/export/{date}': { get: { summary: 'Download the dispatch file (one row per stop, ready for Elite TMS / Samsara)', parameters: [{ name: 'format', in: 'query', schema: { type: 'string', enum: ['csv', 'json'] } }, { name: 'plan', in: 'query', schema: { type: 'string', description: 'copilot | manual | custom plan id' } }] } },
       '/api/v1/scenarios/{date}': { get: { summary: 'Ready-made disruption scenarios for the day' } },
+      '/api/v1/events/{date}': { get: { summary: 'The simulated road & weather events for the day. Add ?events=1 to any plan, compare, conflicts, export or scenario call to include them.' } },
+      '/api/v1/reports/{date}': { get: { summary: 'Problems reported by drivers today (dispatcher alerts)' }, post: { summary: 'Driver reports a problem; returns ranked recovery options', requestBody: { content: { 'application/json': { example: { route: 'R09', kind: 'traffic', delayMin: 45, time: 600 } } } } } },
+      '/api/v1/reports/{date}/{id}': { get: { summary: 'One driver report with its recovery options' }, delete: { summary: 'Dismiss a driver report' } },
       '/api/v1/disruptions/{date}': { post: { summary: 'Evaluate a disruption and get ranked recovery options', requestBody: { content: { 'application/json': { example: { type: 'breakdown', route: 'R01', time: 704 } } } } } },
       '/api/v1/assumptions': { get: { summary: 'Every modelling assumption behind the numbers', security: [] } },
     },
@@ -313,6 +356,7 @@ const server = http.createServer(async (req, res) => {
     const m = pathname.match(r.re);
     if (!m || r.method !== req.method) continue;
     if (!r.open && (req.headers['x-api-key'] || u.query.api_key) !== API_KEY) return err(res, 401, 'Missing or invalid API key. Send header X-API-Key.', { hint: 'Demo key: ' + API_KEY });
+    EV = u.query.events === '1' || u.query.events === 'on';
     try {
       const out = await r.handler(m.groups || {}, u.query, req, res);
       if (out !== undefined && !res.headersSent) send(res, 200, out, { 'X-Compute-Ms': String(Date.now() - t0) });
@@ -335,7 +379,7 @@ server.listen(PORT, () => {
   (function next() {
     const d = queue.shift();
     if (!d) { summaryAll(); console.log(`Planned ${DATES.length} days in ${Date.now() - t} ms`); return; }
-    compareOf(d); scenariosOf(d);
+    compareOf(d, false); scenariosOf(d, false);
     setTimeout(next, 5);
   })();
 });

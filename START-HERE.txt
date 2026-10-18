@@ -1,0 +1,41 @@
+DISPATCH COPILOT - HOW TO RUN IT
+Catalyst Hackathon, Team #13
+
+You need: a Windows or Mac computer with internet access (for the map and fonts).
+Nothing else is installed except Node.js (step 1).
+
+1. INSTALL NODE.JS (once)
+   - Go to https://nodejs.org and download the "LTS" version.
+   - Run the installer and click Next / Continue until it finishes. Keep the default options.
+
+2. UNZIP THE FOLDER
+   - Windows: right-click the zip file > "Extract All..." > Extract.
+     (Do not run it from inside the zip; it must be extracted first.)
+   - Mac: double-click the zip file.
+
+3. START THE APP
+   - Windows: open the extracted "dispatch-copilot" folder and double-click "start-windows.bat".
+     If a blue "Windows protected your PC" box appears, click "More info" > "Run anyway".
+   - Mac: open the "dispatch-copilot" folder, right-click "start-mac.command" > Open > Open.
+     (Right-click is only needed the first time.)
+   - A black window opens and says "Dispatch Copilot running on http://localhost:8080".
+   - Your browser opens the app after a few seconds. If it does not, open
+     http://localhost:8080 yourself.
+
+4. USE IT
+   - Wait about 15 seconds the first time; the app plans all 10 days in the background.
+   - The green dot at the top right says "API connected" when everything is working.
+   - Follow the "Dispatch Copilot - Demo Flow & Button Guide" doc for the demo.
+
+5. STOP IT
+   - Close the black window (or press Ctrl + C in it).
+
+IF SOMETHING GOES WRONG
+   - "Node.js is not installed": do step 1, then start again. On Windows, restart the
+     computer if it still says this after installing.
+   - "EADDRINUSE" / "address already in use": the app is already running in another
+     window. Close that window, or just open http://localhost:8080.
+   - The map is grey: check your internet connection.
+   - Nothing happens on the Mac: open Terminal, type  cd  and a space, drag the
+     dispatch-copilot folder into the Terminal window, press Enter, then type
+     node server.js  and press Enter.

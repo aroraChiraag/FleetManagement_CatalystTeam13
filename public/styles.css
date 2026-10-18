@@ -59,6 +59,10 @@ code, pre, .mono { font-family: ui-monospace, 'SFMono-Regular', Consolas, monosp
 .api-dot { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
 .api-dot i { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; }
 .api-dot.local i { background: var(--warn); }
+.api-dot.down { color: var(--crit); font-weight: 600; }
+.api-dot.down i { background: var(--crit); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .api-dot.down i { animation: none; } }
 
 .nav {
   position: fixed; top: var(--top-h); bottom: 0; left: 0; width: var(--nav-w); z-index: 900;
@@ -371,3 +375,87 @@ pre.code .k { color: #8FA6FF; }
 .toast.bad { border-left: 4px solid #FF6B6B; }
 .toast.good { border-left: 4px solid #3DDC97; }
 @media (max-width: 860px) { .toast { left: 16px; right: 16px; bottom: 76px; } }
+
+
+/* ---- driver view (phone-first) and dispatcher alerts */
+.drv { max-width: 560px; }
+.drv .who { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.drv .who h2 { margin: 0; font-size: 20px; }
+.drv-stops { list-style: none; margin: 0; padding: 0; }
+.drv-stops li { display: grid; grid-template-columns: 58px 1fr auto; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.drv-stops li:last-child { border-bottom: 0; }
+.drv-stops .eta { font-weight: 700; font-variant-numeric: tabular-nums; }
+.drv-stops .eta s { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
+.drv-stops .where b { display: block; }
+.drv-stops .where span { font-size: 12px; color: var(--muted); }
+.drv-stops li.done { opacity: .5; }
+.drv-stops li.next { background: var(--blue-50); margin: 0 -12px; padding: 10px 12px; border-radius: 8px; border-bottom-color: transparent; }
+.report-kinds { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.report-kinds button { min-height: 64px; border: 2px solid var(--line); border-radius: 12px; background: var(--white); font: inherit; font-weight: 700; font-size: 15px; color: var(--ink); cursor: pointer; padding: 10px; text-align: left; display: flex; gap: 10px; align-items: center; }
+.report-kinds button svg { width: 22px; height: 22px; flex: none; }
+.report-kinds button.on { border-color: var(--crit); background: var(--crit-50); color: var(--crit); }
+.report-kinds button:focus-visible, .delay-pick button:focus-visible { outline: 3px solid var(--blue); outline-offset: 2px; }
+.delay-pick { display: flex; gap: 8px; flex-wrap: wrap; }
+.delay-pick button { border: 1px solid var(--line); background: var(--white); border-radius: 999px; padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+.delay-pick button.on { background: var(--ink); color: var(--white); border-color: var(--ink); }
+.btn.big { width: 100%; justify-content: center; padding: 14px; font-size: 16px; background: var(--crit); border-color: var(--crit); }
+.sent { border-left: 4px solid var(--ok); }
+.alerts { position: fixed; top: calc(var(--top-h) + 10px); right: 16px; z-index: 1500; display: flex; flex-direction: column; gap: 10px; width: min(400px, calc(100vw - 32px)); }
+.alert-card { background: var(--white); border: 1px solid var(--line); border-left: 4px solid var(--crit); border-radius: 10px; box-shadow: 0 10px 30px rgba(3, 7, 24, .18); padding: 12px 14px; font-size: 13px; }
+.alert-card .t { display: flex; gap: 8px; align-items: center; font-weight: 700; color: var(--crit); }
+.alert-card .t svg { width: 16px; height: 16px; }
+.alert-card p { margin: 6px 0 10px; color: var(--ink); }
+.alert-card .rec { color: var(--muted); }
+.alert-card .row { gap: 8px; }
+
+/* ---------------------------------------------------------------- driver selection on the plan map */
+.drvsel { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; background: var(--white); border-radius: var(--radius); box-shadow: var(--shadow); padding: 10px 14px; margin-bottom: 10px; min-height: 44px; }
+.drvsel-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.drv-chip { display: inline-flex; align-items: center; gap: 6px; border: 1.5px solid; border-radius: 999px; padding: 2px 4px 2px 9px; font-size: 12px; font-weight: 700; background: var(--white); }
+.drv-chip i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.drv-chip button { border: 0; background: transparent; font-size: 15px; line-height: 1; color: var(--muted); padding: 0 4px; border-radius: 50%; }
+.drv-chip button:hover { color: var(--crit); }
+.drvsel-stats { color: var(--ink-2); }
+.drvsel .row { margin-left: auto; }
+.pick-cell { width: 44px; white-space: nowrap; }
+.pick-cell input { width: 16px; height: 16px; cursor: pointer; vertical-align: middle; margin: 0 4px 0 0; }
+
+/* ---------------------------------------------------------------- simpler API page */
+.dl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.dl { display: flex; gap: 12px; align-items: flex-start; border: 1px solid var(--line); border-radius: 10px; padding: 14px; color: var(--ink); text-decoration: none; background: var(--white); }
+.dl:hover { border-color: var(--blue); background: var(--blue-50); text-decoration: none; }
+.dl > svg { width: 22px; height: 22px; color: var(--blue); flex: none; margin-top: 2px; }
+.dl b { display: block; font-size: 14px; }
+.dl span span { display: block; font-size: 12px; color: var(--muted); margin-top: 3px; }
+.more-eps { margin-top: 10px; }
+.more-eps summary { cursor: pointer; font-weight: 700; font-size: 12.5px; color: var(--blue); padding: 6px 0; }
+details.faq { background: var(--white); border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 8px; }
+details.faq summary { padding: 14px 18px; font-weight: 700; cursor: pointer; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+details.faq summary::-webkit-details-marker { display: none; }
+details.faq summary::after { content: '+'; font-size: 20px; color: var(--blue); line-height: 1; }
+details.faq[open] summary::after { content: '−'; }
+.faq-body { padding: 0 18px 16px; font-size: 13px; }
+.faq-body p { margin-bottom: 6px; }
+
+/* driver view: several problems can be ticked at once */
+.report-kinds button { position: relative; }
+.report-kinds .tick { position: absolute; top: 6px; right: 9px; width: 18px; height: 18px; border-radius: 50%; background: var(--crit); color: var(--white); font-size: 11px; display: grid; place-items: center; }
+#dSend[disabled] { opacity: .45; cursor: not-allowed; }
+
+/* ---------------------------------------------------------------- why a stop is late, simulated events */
+.ev-toggle { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); background: var(--white); color: var(--muted); border-radius: 8px; padding: 6px 10px; font: inherit; font-size: 12.5px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+.ev-toggle svg { width: 16px; height: 16px; }
+.ev-toggle.on { border-color: var(--crit); color: var(--crit); background: var(--crit-50); }
+.ev-off { background: var(--white); border: 1px dashed #CDD1DA; box-shadow: none; }
+.ev-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: middle; }
+.whybox { margin-top: 6px; font-size: 12.5px; background: #F7F8FB; border-left: 3px solid var(--line); border-radius: 6px; padding: 7px 10px; }
+.whybox .chip { margin-right: 4px; }
+.why-more { margin-top: 4px; }
+.why-more summary { cursor: pointer; color: var(--blue); font-weight: 700; font-size: 12px; }
+.why-more ul { margin: 6px 0 0; padding-left: 18px; }
+.why-more li { margin: 2px 0; }
+.why-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin: 8px 0 6px; background: #EDEFF4; }
+.why-bar i { display: block; height: 100%; }
+.why-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
+.why-legend i { width: 10px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 4px; vertical-align: middle; }
+@media (max-width: 860px) { .ev-toggle span { display: none; } }

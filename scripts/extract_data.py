@@ -286,6 +286,7 @@ def main(src, dst):
                 "drivers": len(drivers),
                 "gpsKm": round(sum(r["actual_dist_km"] or 0 for r in day_routes), 1),
                 "plannedKm": round(sum(r["planned_dist_km"] or 0 for r in day_routes), 1),
+                "logbookKm": round(sum(d["hos_distance_km"] or 0 for d in ddays if d["day"] == day and d["n_stops"])),
                 "apptMissed": sum(r["n_appt_missed"] or 0 for r in day_routes),
                 "apptRisk": sum(r["n_appt_risk"] or 0 for r in day_routes),
                 "replans": sum(r["n_updates"] or 0 for r in day_routes),
@@ -293,6 +294,25 @@ def main(src, dst):
             },
         }
         print(day, len(tasks), "tasks", len(pairs), "pairs", len(drivers), "drivers", late_dispatch, "late")
+
+    # learned stop time per customer: median Samsara time on site on OTHER days (leave-one-day-out),
+    # visits under 2 min are app taps, not measured visits; clamp to 5-90 min
+    import statistics
+    visits = collections.defaultdict(list)
+    for d, v in dataset["days"].items():
+        for t in v["tasks"]:
+            w = (t.get("hist") or {}).get("dwell")
+            if w is not None and w >= 2:
+                visits[t["customer"]].append((d, w))
+    for d, v in dataset["days"].items():
+        for t in v["tasks"]:
+            other = [w for dd, w in visits.get(t["customer"], []) if dd != d]
+            if other:
+                t["histSvc"] = round(min(90, max(5, statistics.median(other))), 1)
+                t["histSvcN"] = len(other)
+
+    # total distance the trucks' own ELD logbooks recorded (includes deadhead and terminal returns)
+    dataset["history"]["logbook_km"] = round(sum(v["actualSummary"]["logbookKm"] for v in dataset["days"].values()))
 
     with open(dst, "w", encoding="utf-8") as f:
         json.dump(dataset, f, separators=(",", ":"), default=str)
